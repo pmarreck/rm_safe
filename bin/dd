@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+
+# dd override shim: an existing of= target can be truncated or overwritten
+# before dd has copied a single byte. Report the requested transfer and require
+# --confirm; ordinary stdout and newly created outputs pass through unchanged.
+
+set -u
+
+REAL_DD=${REAL_DD-}
+SELF_PATH=$0
+if [[ $SELF_PATH != /* ]]; then
+	resolved_self=$(type -P "$SELF_PATH" 2>/dev/null || true)
+	[[ -n $resolved_self ]] && SELF_PATH=$resolved_self
+fi
+
+fail() {
+	echo "dd override: $*" >&2
+	exit 1
+}
+
+show_help() {
+	cat <<'EOF'
+Usage: dd [OPERAND]...
+
+Passes through to the system dd command. When of= names an existing output,
+reports the target and requested transfer parameters, then requires --confirm
+before permitting the potentially irreversible write.
+EOF
+}
+
+is_self() {
+	[[ -e $1 && $1 -ef $SELF_PATH ]]
+}
+
+resolve_real_dd() {
+	local candidate
+	if [[ -n $REAL_DD ]]; then
+		if [[ -x $REAL_DD ]] && ! is_self "$REAL_DD"; then
+			printf '%s' "$REAL_DD"
+			return 0
+		fi
+		return 1
+	fi
+
+	candidate=$(type -P gdd 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
+		printf '%s' "$candidate"
+		return 0
+	fi
+	while IFS= read -r candidate; do
+		if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done < <(type -aP dd 2>/dev/null)
+	for candidate in /usr/bin/dd /bin/dd; do
+		if [[ -x $candidate ]] && ! is_self "$candidate"; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+file_size() {
+	local path=$1 candidate size
+	candidate=$(type -P gstat 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate ]]; then
+		size=$("$candidate" -c %s -- "$path" 2>/dev/null) && {
+			printf '%s' "$size"
+			return 0
+		}
+	fi
+	while IFS= read -r candidate; do
+		[[ -x $candidate ]] || continue
+		size=$("$candidate" -c %s -- "$path" 2>/dev/null) && {
+			printf '%s' "$size"
+			return 0
+		}
+		size=$("$candidate" -f %z "$path" 2>/dev/null) && {
+			printf '%s' "$size"
+			return 0
+		}
+	done < <(type -aP stat 2>/dev/null)
+	return 1
+}
+
+resolve_path() {
+	local path=$1 candidate resolved
+	for candidate in "$(type -P grealpath 2>/dev/null || true)" "$(type -P realpath 2>/dev/null || true)"; do
+		[[ -n $candidate && -x $candidate ]] || continue
+		resolved=$("$candidate" "$path" 2>/dev/null) && {
+			printf '%s' "$resolved"
+			return 0
+		}
+	done
+	return 1
+}
+
+output_kind() {
+	local path=$1
+	if [[ -b $path ]]; then printf 'block device'
+	elif [[ -c $path ]]; then printf 'character device'
+	elif [[ -d $path ]]; then printf 'directory or mount point'
+	elif [[ -p $path ]]; then printf 'named pipe'
+	elif [[ -S $path ]]; then printf 'socket'
+	elif [[ -L $path ]]; then printf 'symbolic link'
+	elif [[ -f $path ]]; then printf 'regular file'
+	else printf 'existing path'
+	fi
+}
+
+# dd's full number grammar includes multiplication and many suffixes. A plain
+# decimal count and block size provide an honest byte upper bound; all other
+# forms remain visible but are described without invented precision.
+plain_decimal() {
+	local digits=$1
+	[[ $digits =~ ^[0-9]+$ ]] || return 1
+	while [[ ${#digits} -gt 1 && ${digits:0:1} == 0 ]]; do
+		digits=${digits:1}
+	done
+	[[ ${#digits} -le 15 ]] || return 1
+	PLAIN_DECIMAL=$((10#$digits))
+}
+
+confirm=false
+output_path=""
+input_path="standard input"
+bs=""
+ibs=""
+obs=""
+count=""
+seek=""
+conversions=""
+input_flags=""
+output_flags=""
+forward=()
+for arg in "$@"; do
+	case $arg in
+		--confirm) confirm=true ;;
+		-h|--help) show_help; exit 0 ;;
+		of=*) output_path=${arg#of=}; forward+=("$arg") ;;
+		if=*) input_path=${arg#if=}; forward+=("$arg") ;;
+		bs=*) bs=${arg#bs=}; forward+=("$arg") ;;
+		ibs=*) ibs=${arg#ibs=}; forward+=("$arg") ;;
+		obs=*) obs=${arg#obs=}; forward+=("$arg") ;;
+		count=*) count=${arg#count=}; forward+=("$arg") ;;
+		seek=*|oseek=*) seek=${arg#*=}; forward+=("$arg") ;;
+		conv=*) conversions=${arg#conv=}; forward+=("$arg") ;;
+		iflag=*) input_flags=${arg#iflag=}; forward+=("$arg") ;;
+		oflag=*) output_flags=${arg#oflag=}; forward+=("$arg") ;;
+		*) forward+=("$arg") ;;
+	esac
+done
+
+real_dd=$(resolve_real_dd) || fail "real dd is unavailable"
+if [[ -z $output_path || ( ! -e $output_path && ! -L $output_path ) || $confirm == true ]]; then
+	exec "$real_dd" "${forward[@]}"
+fi
+
+kind=$(output_kind "$output_path")
+resolved=$(resolve_path "$output_path" 2>/dev/null || true)
+current_size=""
+[[ $kind == "regular file" ]] && current_size=$(file_size "$output_path" 2>/dev/null || true)
+effective_ibs=$ibs
+effective_obs=$obs
+[[ -n $bs ]] && { effective_ibs=$bs; effective_obs=$bs; }
+[[ -z $effective_ibs ]] && effective_ibs=512
+[[ -z $effective_obs ]] && effective_obs=512
+
+echo "dd override: confirmation required; an existing output may be overwritten:" >&2
+echo "  output operand: $output_path" >&2
+[[ -n $resolved ]] && echo "  resolved target: $resolved" >&2
+echo "  output type: $kind" >&2
+[[ -n $current_size ]] && echo "  current size: $current_size bytes" >&2
+echo "  input: $input_path" >&2
+echo "  requested transfer parameters:" >&2
+[[ -n $bs ]] && echo "    bs=$bs" >&2
+[[ -n $ibs ]] && echo "    ibs=$ibs" >&2
+[[ -n $obs ]] && echo "    obs=$obs" >&2
+[[ -n $count ]] && echo "    count=$count" >&2
+[[ -n $seek ]] && echo "    seek=$seek" >&2
+[[ -n $conversions ]] && echo "    conv=$conversions" >&2
+[[ -n $input_flags ]] && echo "    iflag=$input_flags" >&2
+[[ -n $output_flags ]] && echo "    oflag=$output_flags" >&2
+
+if [[ -z $count ]]; then
+	echo "  transfer bound: unbounded input (no count= operand)" >&2
+elif plain_decimal "$count"; then
+	count_value=$PLAIN_DECIMAL
+	if plain_decimal "$effective_ibs"; then
+		block_size=$PLAIN_DECIMAL
+		if [[ $count_value -le $((9223372036854775807 / block_size)) ]]; then
+			echo "  maximum input bytes: $((count_value * block_size))" >&2
+		else
+			echo "  transfer bound: exceeds the supported integer range" >&2
+		fi
+	else
+		echo "  transfer bound: cannot calculate count × input block size exactly" >&2
+	fi
+else
+	echo "  transfer bound: cannot calculate count × input block size exactly" >&2
+fi
+
+if [[ -n $seek ]]; then
+	if plain_decimal "$seek"; then
+		seek_value=$PLAIN_DECIMAL
+		if plain_decimal "$effective_obs"; then
+			output_block_size=$PLAIN_DECIMAL
+			if [[ $seek_value -le $((9223372036854775807 / output_block_size)) ]]; then
+				echo "  output offset: $((seek_value * output_block_size)) bytes" >&2
+			else
+				echo "  output offset: exceeds the supported integer range" >&2
+			fi
+		else
+			echo "  output offset: cannot calculate seek × output block size exactly" >&2
+		fi
+	else
+		echo "  output offset: cannot calculate seek × output block size exactly" >&2
+	fi
+fi
+
+echo "Re-run with --confirm to perform the requested dd operation." >&2
+exit 1

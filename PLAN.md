@@ -44,16 +44,17 @@ directory without accepting a non-empty one.
       The forecast reports current/requested/discarded bytes for absolute,
       relative, reference, rounding, and I/O-block forms; unproved expressions
       fail closed until confirmed. (2026-08-11 16:05 EDT)
-- [ ] Add a RED `dd` guard: overwriting an existing output, special file, or
-      mountpoint reports the resolved target and requested transfer parameters,
-      then requires `--confirm`. Curiosity poke: `dd` option aliases, operand
-      order, and unbounded input make an exact byte forecast unavailable.
+- [x] Add a RED `dd` guard, then require `--confirm` when `of=` names an
+      existing regular, special, or directory/mount target. Report target type,
+      resolved path, current regular-file size, transfer operands, and only
+      honest bounds. (2026-08-11 16:04 EDT)
 - [ ] Decide whether `unlink` should join the safe-trash surface.
 - [x] Commit the verified rmdir unit after the audit decision. (`53de1ef`,
       2026-08-11 15:21 EDT)
 - [x] Commit the verified fail-closed `rm` and `find -delete` unit.
       (2026-08-11 15:33 EDT)
 - [x] Commit the verified `truncate --confirm` unit. (2026-08-11 15:52 EDT)
+- [x] Commit the verified `dd --confirm` unit. (2026-08-11 16:04 EDT)
 
 Found in the full gate: an inherited Bash `find` function could hide log
 fragments after `HOME` isolation, breaking Bash `--undo`. Executable-path

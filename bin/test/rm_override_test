@@ -10,6 +10,7 @@ RM_SHIM="$REPO_ROOT/bin/rm"
 RMDIR_SHIM="$REPO_ROOT/bin/rmdir"
 FIND_SHIM="$REPO_ROOT/bin/find"
 TRUNCATE_SHIM="$REPO_ROOT/bin/truncate"
+DD_SHIM="$REPO_ROOT/bin/dd"
 SELF="$RM_SHIM"
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-override-test.XXXXXX")
@@ -38,7 +39,7 @@ chmod +x "$LUAJIT_STUB_DIR/luajit"
 # symlink-only overlay instead: the tools the shim needs, and no luajit.
 NO_LUAJIT_DIR="$test_dir/no_luajit"
 mkdir -p "$NO_LUAJIT_DIR"
-for _c in bash dirname find truncate stat; do
+for _c in bash dirname find truncate dd stat; do
 	_p=$(PATH="$PATH_SAFE" type -P "$_c" 2>/dev/null)
 	[[ -n $_p ]] && ln -sf -- "$_p" "$NO_LUAJIT_DIR/$_c"
 done
@@ -520,6 +521,96 @@ if [[ $truncate_block_reference_rc -ne 0 && $truncate_block_reference_size -eq 4
 	echo "✓ truncate shadow leaves reference sizes in bytes under I/O-block mode"
 else
 	echo "✗ truncate shadow reinterpreted a reference size as I/O blocks" >&2
+	((fails++))
+fi
+
+# Test 24: an existing dd output needs confirmation and reports its forecast.
+((tests++))
+dd_input="$test_dir/dd input"
+dd_output="$test_dir/dd output"
+printf 'abc' >"$dd_input"
+printf '0123456789' >"$dd_output"
+real_dd=$(PATH="$PATH_SAFE" type -P dd)
+REAL_DD="$real_dd" "$DD_SHIM" if="$dd_input" of="$dd_output" bs=1 count=3 \
+	>"$test_dir/dd-out.txt" 2>"$test_dir/dd-err.txt"
+dd_guard_rc=$?
+dd_output_size=$(wc -c <"$dd_output")
+if [[ $dd_guard_rc -ne 0 && $dd_output_size -eq 10 \
+	&& $(grep -c "confirmation required" "$test_dir/dd-err.txt") -eq 1 \
+	&& $(grep -c "current size: 10 bytes" "$test_dir/dd-err.txt") -eq 1 \
+	&& $(grep -c "input: $dd_input" "$test_dir/dd-err.txt") -eq 1 \
+	&& $(grep -c "bs=1" "$test_dir/dd-err.txt") -eq 1 \
+	&& $(grep -c "count=3" "$test_dir/dd-err.txt") -eq 1 \
+	&& $(grep -c "maximum input bytes: 3" "$test_dir/dd-err.txt") -eq 1 \
+	&& $(grep -c -- "--confirm" "$test_dir/dd-err.txt") -eq 1 ]]; then
+	echo "✓ dd shadow forecasts existing-output overwrite and requires confirmation"
+else
+	echo "✗ dd shadow did not guard an existing output" >&2
+	((fails++))
+fi
+
+# Test 25: confirmation permits an overwrite, while a new output passes through.
+((tests++))
+REAL_DD="$real_dd" "$DD_SHIM" --confirm if="$dd_input" of="$dd_output" bs=1 count=3 \
+	>"$test_dir/dd-confirm-out.txt" 2>"$test_dir/dd-confirm-err.txt"
+dd_confirm_rc=$?
+dd_confirm_contents=$(cat "$dd_output")
+dd_new_output="$test_dir/dd new output"
+REAL_DD="$real_dd" "$DD_SHIM" if="$dd_input" of="$dd_new_output" bs=1 count=3 \
+	>"$test_dir/dd-new-out.txt" 2>"$test_dir/dd-new-err.txt"
+dd_new_rc=$?
+dd_new_contents=$(cat "$dd_new_output")
+if [[ $dd_confirm_rc -eq 0 && $dd_confirm_contents == abc \
+	&& $dd_new_rc -eq 0 && $dd_new_contents == abc ]]; then
+	echo "✓ dd shadow permits confirmed overwrite and new output"
+else
+	echo "✗ dd shadow did not preserve confirmed/new-output behavior" >&2
+	((fails++))
+fi
+
+# Test 26: special output targets receive the same confirmation boundary.
+((tests++))
+REAL_DD="$real_dd" "$DD_SHIM" if="$dd_input" of=/dev/null bs=1 count=3 \
+	>"$test_dir/dd-special-out.txt" 2>"$test_dir/dd-special-err.txt"
+dd_special_rc=$?
+if [[ $dd_special_rc -ne 0 \
+	&& $(grep -c "output type: character device" "$test_dir/dd-special-err.txt") -eq 1 \
+	&& $(grep -c "maximum input bytes: 3" "$test_dir/dd-special-err.txt") -eq 1 ]]; then
+	echo "✓ dd shadow requires confirmation for special outputs"
+else
+	echo "✗ dd shadow did not guard a special output" >&2
+	((fails++))
+fi
+
+# Test 27: leading-zero numeric operands still produce an exact bound.
+((tests++))
+dd_leading_zero="$test_dir/dd leading zero"
+printf '0123456789' >"$dd_leading_zero"
+REAL_DD="$real_dd" "$DD_SHIM" if="$dd_input" of="$dd_leading_zero" bs=1 count=003 \
+	>"$test_dir/dd-leading-out.txt" 2>"$test_dir/dd-leading-err.txt"
+dd_leading_rc=$?
+dd_leading_size=$(wc -c <"$dd_leading_zero")
+if [[ $dd_leading_rc -ne 0 && $dd_leading_size -eq 10 \
+	&& $(grep -c "maximum input bytes: 3" "$test_dir/dd-leading-err.txt") -eq 1 ]]; then
+	echo "✓ dd shadow calculates leading-zero operands without octal drift"
+else
+	echo "✗ dd shadow did not calculate a leading-zero operand" >&2
+	((fails++))
+fi
+
+# Test 28: without REAL_DD, a later PATH entry supplies the real tool.
+((tests++))
+dd_resolver="$test_dir/dd resolver"
+printf '0123456789' >"$dd_resolver"
+REAL_DD= PATH="$REPO_ROOT/bin:$NO_LUAJIT_PATH" "$DD_SHIM" if="$dd_input" of="$dd_resolver" bs=1 count=3 \
+	>"$test_dir/dd-resolver-out.txt" 2>"$test_dir/dd-resolver-err.txt"
+dd_resolver_rc=$?
+dd_resolver_size=$(wc -c <"$dd_resolver")
+if [[ $dd_resolver_rc -ne 0 && $dd_resolver_size -eq 10 \
+	&& $(grep -c "maximum input bytes: 3" "$test_dir/dd-resolver-err.txt") -eq 1 ]]; then
+	echo "✓ dd shadow resolves real dd from a later PATH entry"
+else
+	echo "✗ dd shadow failed to resolve real dd from PATH" >&2
 	((fails++))
 fi
 

@@ -58,6 +58,7 @@
               cp bin/rmdir $out/bin/rmdir
               cp bin/find $out/bin/find
               cp bin/truncate $out/bin/truncate
+              cp bin/dd $out/bin/dd
               makeWrapper ${pkgs.luajit}/bin/luajit $out/bin/rm-safe \
                 --add-flags $out/bin/rm-safe-luajit \
                 --prefix PATH : ${lib.makeBinPath runtimeDeps}
@@ -75,6 +76,9 @@
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
               wrapProgram $out/bin/truncate \
                 --set REAL_TRUNCATE ${pkgs.coreutils}/bin/truncate \
+                --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+              wrapProgram $out/bin/dd \
+                --set REAL_DD ${pkgs.coreutils}/bin/dd \
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
             '';
           };

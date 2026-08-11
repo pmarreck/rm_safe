@@ -4,8 +4,8 @@ rm-safe
 [![CI](https://github.com/pmarreck/rm_safe/actions/workflows/ci.yml/badge.svg?branch=yolo)](https://github.com/pmarreck/rm_safe/actions/workflows/ci.yml)
 [![Garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fpmarreck%2Frm_safe%3Fbranch%3Dyolo)](https://garnix.io/repo/pmarreck/rm_safe)
 
-Safe `rm`, `rmdir`, `find -delete`, and `truncate` shadows that prevent or
-interpose on irreversible command-line data loss. Includes small shims and
+Safe `rm`, `rmdir`, `find -delete`, `truncate`, and `dd` shadows that prevent
+or interpose on irreversible command-line data loss. Includes small shims and
 guidance for macOS, common Linux sudoers setups, and NixOS.
 
 Features
@@ -13,6 +13,7 @@ Features
 - Moves verified-empty directories invoked through `rmdir` to Trash too.
 - Converts a restricted terminal `find -delete` expression into safe Trash moves.
 - Requires explicit confirmation before `truncate` shrinks an existing file.
+- Requires explicit confirmation before `dd` writes to an existing `of=` target.
 - Refuses to touch protected locations (`/`, `/etc`, `/nix/store`, etc.).
 - Works with sudo via a wrapper, not shell aliases.
 - Restores manual trash entries with `--undo` or `--undo-picker` (gum or fzf).
@@ -29,6 +30,7 @@ ln -s "$PWD/rm-safe/bin/rm"           ~/.local/bin/rm
 ln -s "$PWD/rm-safe/bin/rmdir"        ~/.local/bin/rmdir
 ln -s "$PWD/rm-safe/bin/find"         ~/.local/bin/find
 ln -s "$PWD/rm-safe/bin/truncate"     ~/.local/bin/truncate
+ln -s "$PWD/rm-safe/bin/dd"           ~/.local/bin/dd
 ln -s "$PWD/rm-safe/bin/rm-safe.bash" ~/.local/bin/rm-safe.bash
 ```
 
@@ -42,6 +44,13 @@ an existing regular file, it reports each target's current and requested size
 plus bytes to discard, then requires `--confirm`. It calculates absolute,
 relative, reference, rounding, and I/O-block size forms; an unrecognized form
 also requires confirmation and reports the limit of its forecast.
+
+The `dd` shadow requires `--confirm` when `of=` names an existing regular,
+special, or directory/mount target. Its refusal names the supplied and resolved
+target when the host can resolve it, type, current regular-file size, input,
+relevant operands, and an
+exact transfer upper bound only when `count` and input block size are plain
+decimal values. With no `count`, it reports that input is unbounded.
 
 The `rmdir` shadow retains the non-recursive boundary: it rejects non-empty
 directories, `--parents`/`-p`, and other rmdir-specific options it cannot carry
@@ -78,6 +87,7 @@ Files
 - `bin/rmdir` — wrapper shim: verifies directories are empty, then dispatches to `rm-safe -r`; it refuses a system-rmdir fallback so a partial install cannot delete permanently.
 - `bin/find` — wrapper shim: passes ordinary searches to real find; rewrites the accepted terminal `-delete` form into NUL-delimited safe Trash moves and reports any failed deletion.
 - `bin/truncate` — wrapper shim: forecasts shrinking existing regular files and requires `--confirm`; it then delegates unchanged to real `truncate` with that private switch removed.
+- `bin/dd` — wrapper shim: forecasts writes to an existing `of=` target and requires `--confirm`; it then delegates unchanged to real `dd` with that private switch removed.
 - `bin/test/rm-safe_test` — undo/restore tests.
 - `bin/test/rm_override_test` — shim tests.
 - `bin/test/fs_shim_test` — proves `bin/rm-safe` needs no LuaFileSystem, and diffs its FFI filesystem shim against real lfs.
@@ -89,12 +99,12 @@ Why sudo setup differs by OS:
 - Most Linux distros set `secure_path` in sudoers, which **replaces** the user `PATH` with a fixed, root-owned path for safety. That means user-level shims are ignored unless you place a root-owned shim in the secure path.
 
 macOS (defaults keep user PATH under sudo)
-- Symlink or copy `bin/rm`, `bin/rmdir`, `bin/find`, and `bin/truncate` into `~/bin` (or any user directory already ahead of `/bin` on PATH).
-- `sudo rm …`, `sudo rmdir …`, `sudo find … -delete`, and `sudo truncate …` will hit the shims because PATH is preserved by default.
+- Symlink or copy `bin/rm`, `bin/rmdir`, `bin/find`, `bin/truncate`, and `bin/dd` into `~/bin` (or any user directory already ahead of `/bin` on PATH).
+- `sudo rm …`, `sudo rmdir …`, `sudo find … -delete`, `sudo truncate …`, and `sudo dd …` will hit the shims because PATH is preserved by default.
 
 Linux with sudo `secure_path`
 - Create a root-owned override dir, e.g. `/usr/bin/overrides` (0755, root:root).
-- Install the shims there as `rm`, `rmdir`, `find`, and `truncate`, and ensure `rm-safe` is reachable (the same dir is simplest).
+- Install the shims there as `rm`, `rmdir`, `find`, `truncate`, and `dd`, and ensure `rm-safe` is reachable (the same dir is simplest).
 - In sudoers (via `visudo`), prepend the override dir:
   ```
   Defaults secure_path="/usr/bin/overrides:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -102,7 +112,7 @@ Linux with sudo `secure_path`
 - Avoid adding broad dirs like `/usr/local/bin` just to get the shim; overrides keeps blast-radius small.
 
 NixOS (declarative)
-- Build/install `rm-safe` and the `rm`/`rmdir`/`find`/`truncate` shims into a root-owned path on PATH, e.g. `/run/wrappers/bin`.
+- Build/install `rm-safe` and the `rm`/`rmdir`/`find`/`truncate`/`dd` shims into a root-owned path on PATH, e.g. `/run/wrappers/bin`.
 - Example snippet:
   ```
   # configuration.nix
@@ -157,6 +167,7 @@ Cautions
 - The `rmdir` shadow checks emptiness before moving a directory. Coordinate concurrent writers around that check; a filesystem cannot atomically test that a directory is empty and rename it into Trash.
 - The `find` shadow rejects `-delete` expressions outside its documented subset before real find runs. A concurrent writer can still change a selected path between traversal and its safe move.
 - The `truncate` shadow samples file size before delegation. A concurrent writer can change a file between its forecast and the confirmed resize, so coordinate writers when exact byte preservation matters.
+- The `dd` shadow cannot know the exact number of bytes a stream will yield or protect a target changed after its forecast. Its confirmation report labels exact bounds only when the operands prove them.
 
 Testing
 - Run all lanes (luajit / bash-4+ / bash-3.2): `bin/test/run-all`
