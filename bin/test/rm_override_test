@@ -9,6 +9,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RM_SHIM="$REPO_ROOT/bin/rm"
 RMDIR_SHIM="$REPO_ROOT/bin/rmdir"
 FIND_SHIM="$REPO_ROOT/bin/find"
+TRUNCATE_SHIM="$REPO_ROOT/bin/truncate"
 SELF="$RM_SHIM"
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-override-test.XXXXXX")
@@ -37,7 +38,7 @@ chmod +x "$LUAJIT_STUB_DIR/luajit"
 # symlink-only overlay instead: the tools the shim needs, and no luajit.
 NO_LUAJIT_DIR="$test_dir/no_luajit"
 mkdir -p "$NO_LUAJIT_DIR"
-for _c in bash dirname find; do
+for _c in bash dirname find truncate stat; do
 	_p=$(PATH="$PATH_SAFE" type -P "$_c" 2>/dev/null)
 	[[ -n $_p ]] && ln -sf -- "$_p" "$NO_LUAJIT_DIR/$_c"
 done
@@ -373,6 +374,152 @@ if [[ $find_resolver_rc -eq 0 && $find_resolver_out == "$find_resolver/keep" \
 	echo "✓ find shadow resolves real find from a later PATH entry"
 else
 	echo "✗ find shadow failed to resolve real find from PATH" >&2
+	((fails++))
+fi
+
+# Test 16: a shrinking resize reports its loss and needs --confirm.
+((tests++))
+truncate_target="$test_dir/truncate target"
+printf '0123456789' >"$truncate_target"
+real_truncate=$(type -P truncate)
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" -s 4 "$truncate_target" \
+	>"$test_dir/truncate-out.txt" 2>"$test_dir/truncate-err.txt"
+truncate_guard_rc=$?
+truncate_size=$(wc -c <"$truncate_target")
+if [[ $truncate_guard_rc -ne 0 && $truncate_size -eq 10 \
+	&& $(grep -c "confirmation required" "$test_dir/truncate-err.txt") -eq 1 \
+	&& $(grep -c "current size: 10 bytes" "$test_dir/truncate-err.txt") -eq 1 \
+	&& $(grep -c "requested size: 4 bytes" "$test_dir/truncate-err.txt") -eq 1 \
+	&& $(grep -c "data discarded: 6 bytes" "$test_dir/truncate-err.txt") -eq 1 \
+	&& $(grep -c -- "--confirm" "$test_dir/truncate-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow forecasts shrinking data loss and requires confirmation"
+else
+	echo "✗ truncate shadow did not guard a shrinking resize" >&2
+	((fails++))
+fi
+
+# Test 17: --confirm performs a shrink, while a growth remains friction-free.
+((tests++))
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" --confirm -s 4 "$truncate_target" \
+	>"$test_dir/truncate-confirm-out.txt" 2>"$test_dir/truncate-confirm-err.txt"
+truncate_confirm_rc=$?
+truncate_confirm_size=$(wc -c <"$truncate_target")
+truncate_growth="$test_dir/truncate growth"
+printf '0123' >"$truncate_growth"
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" -s 10 "$truncate_growth" \
+	>"$test_dir/truncate-growth-out.txt" 2>"$test_dir/truncate-growth-err.txt"
+truncate_growth_rc=$?
+truncate_growth_size=$(wc -c <"$truncate_growth")
+if [[ $truncate_confirm_rc -eq 0 && $truncate_confirm_size -eq 4 \
+	&& $truncate_growth_rc -eq 0 && $truncate_growth_size -eq 10 ]]; then
+	echo "✓ truncate shadow permits confirmed shrinkage and ordinary growth"
+else
+	echo "✗ truncate shadow did not preserve confirmed/growing behavior" >&2
+	((fails++))
+fi
+
+# Test 18: relative shrinkage gets the same exact preflight forecast.
+((tests++))
+truncate_relative="$test_dir/truncate relative"
+printf '0123456789' >"$truncate_relative"
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" -s -3 "$truncate_relative" \
+	>"$test_dir/truncate-relative-out.txt" 2>"$test_dir/truncate-relative-err.txt"
+truncate_relative_rc=$?
+truncate_relative_size=$(wc -c <"$truncate_relative")
+if [[ $truncate_relative_rc -ne 0 && $truncate_relative_size -eq 10 \
+	&& $(grep -c "requested size: 7 bytes" "$test_dir/truncate-relative-err.txt") -eq 1 \
+	&& $(grep -c "data discarded: 3 bytes" "$test_dir/truncate-relative-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow forecasts relative shrinkage exactly"
+else
+	echo "✗ truncate shadow did not forecast relative shrinkage exactly" >&2
+	((fails++))
+fi
+
+# Test 19: reference-sized shrinkage reports the actual reference result.
+((tests++))
+truncate_reference="$test_dir/truncate reference"
+truncate_reference_target="$test_dir/truncate reference target"
+printf '012' >"$truncate_reference"
+printf '0123456789' >"$truncate_reference_target"
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" --reference "$truncate_reference" "$truncate_reference_target" \
+	>"$test_dir/truncate-reference-out.txt" 2>"$test_dir/truncate-reference-err.txt"
+truncate_reference_rc=$?
+truncate_reference_size=$(wc -c <"$truncate_reference_target")
+if [[ $truncate_reference_rc -ne 0 && $truncate_reference_size -eq 10 \
+	&& $(grep -c "requested size: 3 bytes" "$test_dir/truncate-reference-err.txt") -eq 1 \
+	&& $(grep -c "data discarded: 7 bytes" "$test_dir/truncate-reference-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow forecasts reference-sized shrinkage exactly"
+else
+	echo "✗ truncate shadow did not forecast reference-sized shrinkage" >&2
+	((fails++))
+fi
+
+# Test 20: I/O block mode compares the effective byte size, not its token.
+((tests++))
+truncate_blocks="$test_dir/truncate blocks"
+printf '0123456789' >"$truncate_blocks"
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" --io-blocks --size 0 "$truncate_blocks" \
+	>"$test_dir/truncate-blocks-out.txt" 2>"$test_dir/truncate-blocks-err.txt"
+truncate_blocks_rc=$?
+truncate_blocks_size=$(wc -c <"$truncate_blocks")
+if [[ $truncate_blocks_rc -ne 0 && $truncate_blocks_size -eq 10 \
+	&& $(grep -c "requested size: 0 bytes" "$test_dir/truncate-blocks-err.txt") -eq 1 \
+	&& $(grep -c "data discarded: 10 bytes" "$test_dir/truncate-blocks-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow forecasts I/O-block shrinkage in bytes"
+else
+	echo "✗ truncate shadow did not forecast I/O-block shrinkage" >&2
+	((fails++))
+fi
+
+# Test 21: I/O block multipliers apply before a relative adjustment.
+((tests++))
+truncate_relative_blocks="$test_dir/truncate relative blocks"
+printf '0123456789' >"$truncate_relative_blocks"
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" --io-blocks --size -1 "$truncate_relative_blocks" \
+	>"$test_dir/truncate-relative-blocks-out.txt" 2>"$test_dir/truncate-relative-blocks-err.txt"
+truncate_relative_blocks_rc=$?
+truncate_relative_blocks_size=$(wc -c <"$truncate_relative_blocks")
+if [[ $truncate_relative_blocks_rc -ne 0 && $truncate_relative_blocks_size -eq 10 \
+	&& $(grep -c "requested size: 0 bytes" "$test_dir/truncate-relative-blocks-err.txt") -eq 1 \
+	&& $(grep -c "data discarded: 10 bytes" "$test_dir/truncate-relative-blocks-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow applies I/O blocks before relative shrinkage"
+else
+	echo "✗ truncate shadow misclassified relative I/O-block shrinkage" >&2
+	((fails++))
+fi
+
+# Test 22: without REAL_TRUNCATE, a later PATH entry supplies the real tool.
+((tests++))
+truncate_resolver="$test_dir/truncate resolver"
+printf '0123456789' >"$truncate_resolver"
+REAL_TRUNCATE= PATH="$REPO_ROOT/bin:$NO_LUAJIT_PATH" "$TRUNCATE_SHIM" -s 4 "$truncate_resolver" \
+	>"$test_dir/truncate-resolver-out.txt" 2>"$test_dir/truncate-resolver-err.txt"
+truncate_resolver_rc=$?
+truncate_resolver_size=$(wc -c <"$truncate_resolver")
+if [[ $truncate_resolver_rc -ne 0 && $truncate_resolver_size -eq 10 \
+	&& $(grep -c "data discarded: 6 bytes" "$test_dir/truncate-resolver-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow resolves real truncate from a later PATH entry"
+else
+	echo "✗ truncate shadow failed to resolve real truncate from PATH" >&2
+	((fails++))
+fi
+
+# Test 23: --io-blocks does not reinterpret a reference file's byte size.
+((tests++))
+truncate_block_reference="$test_dir/truncate block reference"
+truncate_block_reference_target="$test_dir/truncate block reference target"
+printf '0' >"$truncate_block_reference"
+printf '%0400d' 0 >"$truncate_block_reference_target"
+REAL_TRUNCATE="$real_truncate" "$TRUNCATE_SHIM" --io-blocks --reference "$truncate_block_reference" "$truncate_block_reference_target" \
+	>"$test_dir/truncate-block-reference-out.txt" 2>"$test_dir/truncate-block-reference-err.txt"
+truncate_block_reference_rc=$?
+truncate_block_reference_size=$(wc -c <"$truncate_block_reference_target")
+if [[ $truncate_block_reference_rc -ne 0 && $truncate_block_reference_size -eq 400 \
+	&& $(grep -c "requested size: 1 bytes" "$test_dir/truncate-block-reference-err.txt") -eq 1 \
+	&& $(grep -c "data discarded: 399 bytes" "$test_dir/truncate-block-reference-err.txt") -eq 1 ]]; then
+	echo "✓ truncate shadow leaves reference sizes in bytes under I/O-block mode"
+else
+	echo "✗ truncate shadow reinterpreted a reference size as I/O blocks" >&2
 	((fails++))
 fi
 

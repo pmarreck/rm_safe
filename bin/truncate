@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+
+# truncate override shim: let a provably non-destructive resize pass through,
+# but require --confirm before an existing regular file loses bytes. An
+# unrecognised size expression also requires confirmation rather than guessing.
+
+set -u
+
+REAL_TRUNCATE=${REAL_TRUNCATE-}
+SELF_PATH=$0
+if [[ $SELF_PATH != /* ]]; then
+	resolved_self=$(type -P "$SELF_PATH" 2>/dev/null || true)
+	[[ -n $resolved_self ]] && SELF_PATH=$resolved_self
+fi
+
+fail() {
+	echo "truncate override: $*" >&2
+	exit 1
+}
+
+show_help() {
+	cat <<'EOF'
+Usage: truncate [OPTION]... FILE...
+
+Passes through to the system truncate command. When an existing regular file
+would shrink, reports the current size, requested size, and discarded byte
+count, then requires --confirm before making the irreversible change.
+EOF
+}
+
+is_self() {
+	[[ -e $1 && $1 -ef $SELF_PATH ]]
+}
+
+resolve_real_truncate() {
+	local candidate
+	if [[ -n $REAL_TRUNCATE ]]; then
+		if [[ -x $REAL_TRUNCATE ]] && ! is_self "$REAL_TRUNCATE"; then
+			printf '%s' "$REAL_TRUNCATE"
+			return 0
+		fi
+		return 1
+	fi
+
+	candidate=$(type -P gtruncate 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
+		printf '%s' "$candidate"
+		return 0
+	fi
+	while IFS= read -r candidate; do
+		if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done < <(type -aP truncate 2>/dev/null)
+	for candidate in /usr/bin/truncate /bin/truncate; do
+		if [[ -x $candidate ]] && ! is_self "$candidate"; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Prints a regular file's byte size using GNU stat when available, then BSD
+# stat. A failure makes the resize unproved and therefore confirmation-only.
+file_size() {
+	local path=$1 candidate size
+	candidate=$(type -P gstat 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate ]]; then
+		size=$("$candidate" -c %s -- "$path" 2>/dev/null) && {
+			printf '%s' "$size"
+			return 0
+		}
+	fi
+	while IFS= read -r candidate; do
+		[[ -x $candidate ]] || continue
+		size=$("$candidate" -c %s -- "$path" 2>/dev/null) && {
+			printf '%s' "$size"
+			return 0
+		}
+		size=$("$candidate" -f %z "$path" 2>/dev/null) && {
+			printf '%s' "$size"
+			return 0
+		}
+	done < <(type -aP stat 2>/dev/null)
+	return 1
+}
+
+# GNU accepts rich arithmetic size expressions. Calculate the forms whose
+# byte result is exact, while rejecting overflow and unknown suffixes before
+# they can disguise a destructive resize.
+calculate_size() {
+	local current=$1 spec=$2 io_blocks=$3 multiplier=1 number suffix modifier remainder
+	local max_size=9223372036854775807
+	CALCULATED_SIZE=""
+	CALCULATION_REASON=""
+	if [[ ! $spec =~ ^([-+/<>\%]?)([0-9]+)([A-Za-z]*)$ ]]; then
+		CALCULATION_REASON="cannot calculate size expression '$spec'"
+		return 1
+	fi
+	modifier=${BASH_REMATCH[1]}
+	number=${BASH_REMATCH[2]}
+	suffix=${BASH_REMATCH[3]}
+	case $suffix in
+		""|B) multiplier=1 ;;
+		b) multiplier=512 ;;
+		K|KiB) multiplier=1024 ;;
+		KB) multiplier=1000 ;;
+		M|MiB) multiplier=1048576 ;;
+		MB) multiplier=1000000 ;;
+		G|GiB) multiplier=1073741824 ;;
+		GB) multiplier=1000000000 ;;
+		*) CALCULATION_REASON="cannot calculate size unit '$suffix'"; return 1 ;;
+	esac
+	while [[ ${#number} -gt 1 && ${number:0:1} == 0 ]]; do
+		number=${number:1}
+	done
+	if [[ ${#number} -gt 15 ]]; then
+		CALCULATION_REASON="size '$spec' exceeds the supported integer range"
+		return 1
+	fi
+	number=$((10#$number))
+	if [[ $number -gt $((max_size / multiplier)) ]]; then
+		CALCULATION_REASON="size '$spec' exceeds the supported integer range"
+		return 1
+	fi
+	number=$((number * multiplier))
+	if [[ $io_blocks == true ]]; then
+		if [[ $number -gt $((max_size / 512)) ]]; then
+			CALCULATION_REASON="size '$spec' exceeds the supported integer range"
+			return 1
+		fi
+		number=$((number * 512))
+	fi
+	case $modifier in
+		"") CALCULATED_SIZE=$number ;;
+		+)
+			if [[ $number -gt $((max_size - current)) ]]; then
+				CALCULATION_REASON="size '$spec' exceeds the supported integer range"
+				return 1
+			fi
+			CALCULATED_SIZE=$((current + number))
+			;;
+		-)
+			if [[ $number -ge $current ]]; then CALCULATED_SIZE=0; else CALCULATED_SIZE=$((current - number)); fi
+			;;
+		'<')
+			if [[ $current -lt $number ]]; then CALCULATED_SIZE=$current; else CALCULATED_SIZE=$number; fi
+			;;
+		'>')
+			if [[ $current -gt $number ]]; then CALCULATED_SIZE=$current; else CALCULATED_SIZE=$number; fi
+			;;
+		/)
+			if [[ $number -eq 0 ]]; then
+				CALCULATION_REASON="cannot round down to a zero-byte multiple"
+				return 1
+			fi
+			CALCULATED_SIZE=$(((current / number) * number))
+			;;
+		%)
+			if [[ $number -eq 0 ]]; then
+				CALCULATION_REASON="cannot round up to a zero-byte multiple"
+				return 1
+			fi
+			remainder=$((current % number))
+			if [[ $remainder -eq 0 ]]; then
+				CALCULATED_SIZE=$current
+			elif [[ $current -gt $((max_size - (number - remainder))) ]]; then
+				CALCULATION_REASON="size '$spec' exceeds the supported integer range"
+				return 1
+			else
+				CALCULATED_SIZE=$((current + number - remainder))
+			fi
+			;;
+	esac
+}
+
+confirm=false
+io_blocks=false
+size_spec=""
+reference_path=""
+unknown_option=""
+forward=()
+operands=()
+end_options=false
+while [[ $# -gt 0 ]]; do
+	arg=$1
+	if [[ $end_options == true ]]; then
+		forward+=("$arg")
+		operands+=("$arg")
+		shift
+		continue
+	fi
+	case $arg in
+		--confirm) confirm=true ;;
+		-h|--help) show_help; exit 0 ;;
+		--)
+			forward+=("$arg")
+			end_options=true
+			;;
+		-s|--size)
+			forward+=("$arg")
+			shift
+			if [[ $# -eq 0 ]]; then
+				real_truncate=$(resolve_real_truncate) || fail "real truncate is unavailable"
+				exec "$real_truncate" "${forward[@]}"
+			fi
+			size_spec=$1
+			forward+=("$1")
+			;;
+		--size=*)
+			size_spec=${arg#--size=}
+			forward+=("$arg")
+			;;
+		-s?*)
+			size_spec=${arg#-s}
+			forward+=("$arg")
+			;;
+		-r|--reference)
+			forward+=("$arg")
+			shift
+			if [[ $# -eq 0 ]]; then
+				real_truncate=$(resolve_real_truncate) || fail "real truncate is unavailable"
+				exec "$real_truncate" "${forward[@]}"
+			fi
+			reference_path=$1
+			forward+=("$1")
+			;;
+		--reference=*)
+			reference_path=${arg#--reference=}
+			forward+=("$arg")
+			;;
+		-o|--io-blocks)
+			io_blocks=true
+			forward+=("$arg")
+			;;
+		-c|--no-create|--version) forward+=("$arg") ;;
+		-*)
+			unknown_option=$arg
+			forward+=("$arg")
+			;;
+		*)
+			operands+=("$arg")
+			forward+=("$arg")
+			;;
+	esac
+	shift
+done
+
+real_truncate=$(resolve_real_truncate) || fail "real truncate is unavailable"
+if [[ -z $size_spec && -z $reference_path ]]; then
+	exec "$real_truncate" "${forward[@]}"
+fi
+
+needs_confirmation=false
+forecast_targets=()
+forecast_current=()
+forecast_requested=()
+forecast_discarded=()
+forecast_limits=()
+if [[ -n $unknown_option ]]; then
+	needs_confirmation=true
+	forecast_limits+=("cannot safely forecast with option '$unknown_option'")
+fi
+
+reference_size=""
+if [[ -n $reference_path ]]; then
+	reference_size=$(file_size "$reference_path" 2>/dev/null || true)
+	if [[ -z $reference_size ]]; then
+		needs_confirmation=true
+		forecast_limits+=("cannot read reference size from '$reference_path'")
+	fi
+fi
+
+for operand in "${operands[@]}"; do
+	[[ -f $operand ]] || continue
+	current_size=$(file_size "$operand" 2>/dev/null || true)
+	if [[ -z $current_size ]]; then
+		needs_confirmation=true
+		forecast_targets+=("$operand")
+		forecast_limits+=("cannot read current size")
+		continue
+	fi
+	requested_spec=$size_spec
+	calculation_io_blocks=$io_blocks
+	if [[ -n $reference_size ]]; then
+		requested_spec=$reference_size
+		# --io-blocks changes a SIZE expression, not the byte count sampled
+		# from a reference file.
+		calculation_io_blocks=false
+	fi
+	if ! calculate_size "$current_size" "$requested_spec" "$calculation_io_blocks"; then
+		needs_confirmation=true
+		forecast_targets+=("$operand")
+		forecast_current+=("$current_size")
+		forecast_requested+=("$requested_spec")
+		forecast_limits+=("$CALCULATION_REASON")
+		continue
+	fi
+	if [[ $CALCULATED_SIZE -lt $current_size ]]; then
+		needs_confirmation=true
+		forecast_targets+=("$operand")
+		forecast_current+=("$current_size")
+		forecast_requested+=("$CALCULATED_SIZE")
+		forecast_discarded+=("$((current_size - CALCULATED_SIZE))")
+	fi
+done
+
+if [[ $needs_confirmation == true && $confirm == false ]]; then
+	echo "truncate override: confirmation required; requested resize may discard data:" >&2
+	for ((i=0; i<${#forecast_targets[@]}; i++)); do
+		echo "  target: ${forecast_targets[$i]}" >&2
+		[[ -n ${forecast_current[$i]:-} ]] && echo "  current size: ${forecast_current[$i]} bytes" >&2
+		[[ -n ${forecast_requested[$i]:-} ]] && echo "  requested size: ${forecast_requested[$i]} bytes" >&2
+		[[ -n ${forecast_discarded[$i]:-} ]] && echo "  data discarded: ${forecast_discarded[$i]} bytes" >&2
+		[[ -n ${forecast_limits[$i]:-} ]] && echo "  forecast limit: ${forecast_limits[$i]}" >&2
+	done
+	for ((i=${#forecast_targets[@]}; i<${#forecast_limits[@]}; i++)); do
+		echo "  forecast limit: ${forecast_limits[$i]}" >&2
+	done
+	echo "Re-run with --confirm to perform the irreversible resize." >&2
+	exit 1
+fi
+
+exec "$real_truncate" "${forward[@]}"

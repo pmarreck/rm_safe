@@ -15,6 +15,7 @@
 - bin/rm: Shim that routes rm -> rm-safe and refuses to call system rm when no safe implementation is available.
 - bin/rmdir: Shim that resolves find to an executable path, verifies every operand is an empty real directory, then routes it to rm-safe with -r; refuses unsupported rmdir-only options and any system-rmdir fallback.
 - bin/find: Shim that passes ordinary searches to real find and transforms one terminal implicit-AND -delete expression into depth-first NUL-delimited paths consumed by the rm/rmdir shadows; reports any failed safe deletion.
+- bin/truncate: Shim that preflights existing regular-file sizes, forecasts byte loss from supported size forms, and requires `--confirm` for shrinking or unprovable resize requests.
 - bin/test/rm-safe_test: Undo/restore tests and picker interaction tests.
 	- Includes symlink-only PATH overlay helper to force `gum`-missing/`fzf`-present behavior even when both tools share one directory (common on Nix).
 - bin/test/rm_override_test: rm/rmdir shim behavior tests, including empty-directory Trash moves, non-empty rejection, and fail-closed partial installs.

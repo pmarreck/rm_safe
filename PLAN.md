@@ -40,19 +40,20 @@ directory without accepting a non-empty one.
       Reject Boolean expressions and duplicate or non-terminal `-delete`
       actions before invoking the real `find`; distinguish literal predicate
       arguments from the deletion action. (2026-08-11 15:33 EDT)
-- [ ] Add a RED `truncate` guard: shrinking an existing file reports current
-      and requested byte counts and requires an explicit `--confirm`; growing
-      files and no-op sizes retain ordinary behavior.
+- [x] Add a RED `truncate` guard, then require `--confirm` for shrinkage.
+      The forecast reports current/requested/discarded bytes for absolute,
+      relative, reference, rounding, and I/O-block forms; unproved expressions
+      fail closed until confirmed. (2026-08-11 16:05 EDT)
 - [ ] Add a RED `dd` guard: overwriting an existing output, special file, or
       mountpoint reports the resolved target and requested transfer parameters,
       then requires `--confirm`. Curiosity poke: `dd` option aliases, operand
       order, and unbounded input make an exact byte forecast unavailable.
-- [ ] Decide whether `unlink` should join the safe-trash surface and whether
-      `bin/rm` should fail closed when no safe implementation is available.
+- [ ] Decide whether `unlink` should join the safe-trash surface.
 - [x] Commit the verified rmdir unit after the audit decision. (`53de1ef`,
       2026-08-11 15:21 EDT)
 - [x] Commit the verified fail-closed `rm` and `find -delete` unit.
       (2026-08-11 15:33 EDT)
+- [x] Commit the verified `truncate --confirm` unit. (2026-08-11 15:52 EDT)
 
 Found in the full gate: an inherited Bash `find` function could hide log
 fragments after `HOME` isolation, breaking Bash `--undo`. Executable-path
