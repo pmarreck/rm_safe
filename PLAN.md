@@ -29,17 +29,17 @@ directory without accepting a non-empty one.
       `rsync --delete`, and Git cleanup out of scope; treat human command-line
       protection as a first-class goal rather than relying only on agent gates.
       (2026-08-11 13:43 EDT)
-- [ ] Specify and reproduce `find -delete` semantics before rewriting it to a
-      null-delimited `rm-safe` input stream. Curiosity poke: `-delete` is both
-      a deletion action and a true expression predicate, so a token replacement
-      can alter `find`'s Boolean expression or directory traversal.
-- [ ] Add a RED fail-closed `rm` case, then remove its system-rm fallback.
-      Curiosity poke: a copied shim without either safe implementation must
-      leave its target untouched even when `REAL_RM` is configured.
-- [ ] Implement the approved `find -delete` subset with a NUL-delimited sink
+- [x] Specify and reproduce `find -delete` semantics: one terminal action plus
+      implicit-AND predicates only, then a null-delimited depth-first stream
+      consumed by the appropriate safe shadow. (2026-08-11 15:28 EDT)
+- [x] Add a RED fail-closed `rm` case, then remove its system-rm fallback. A
+      copied shim without either safe implementation leaves its target untouched
+      even when `REAL_RM` is configured. (2026-08-11 15:21 EDT)
+- [x] Implement the approved `find -delete` subset with a NUL-delimited sink
       that dispatches files/symlinks to `rm-safe` and directories to `rmdir`.
       Reject Boolean expressions and duplicate or non-terminal `-delete`
-      actions before invoking the real `find`.
+      actions before invoking the real `find`; distinguish literal predicate
+      arguments from the deletion action. (2026-08-11 15:33 EDT)
 - [ ] Add a RED `truncate` guard: shrinking an existing file reports current
       and requested byte counts and requires an explicit `--confirm`; growing
       files and no-op sizes retain ordinary behavior.
@@ -49,7 +49,10 @@ directory without accepting a non-empty one.
       order, and unbounded input make an exact byte forecast unavailable.
 - [ ] Decide whether `unlink` should join the safe-trash surface and whether
       `bin/rm` should fail closed when no safe implementation is available.
-- [ ] Commit the verified rmdir unit after the audit decision.
+- [x] Commit the verified rmdir unit after the audit decision. (`53de1ef`,
+      2026-08-11 15:21 EDT)
+- [x] Commit the verified fail-closed `rm` and `find -delete` unit.
+      (2026-08-11 15:33 EDT)
 
 Found in the full gate: an inherited Bash `find` function could hide log
 fragments after `HOME` isolation, breaking Bash `--undo`. Executable-path

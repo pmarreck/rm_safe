@@ -8,6 +8,7 @@ tests=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RM_SHIM="$REPO_ROOT/bin/rm"
 RMDIR_SHIM="$REPO_ROOT/bin/rmdir"
+FIND_SHIM="$REPO_ROOT/bin/find"
 SELF="$RM_SHIM"
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-override-test.XXXXXX")
@@ -68,9 +69,9 @@ else
 	((fails++))
 fi
 
-# Test 2: Falls back and warns when rm-safe AND rm-safe.bash are both missing
-# Use a shim copy isolated in its own dir (no bash impl sibling), so we hit
-# the final REAL_RM fallback with "rm-safe not found" warning.
+# Test 2: Fails closed when rm-safe AND rm-safe.bash are both missing.
+# Use a shim copy isolated in its own dir (no bash impl sibling), so the
+# final branch must leave the target alone rather than reach REAL_RM.
 ((tests++))
 shim2_dir="$test_dir/shim2"
 mkdir -p "$shim2_dir"
@@ -84,20 +85,24 @@ cp "$RM_SHIM" "$shim2_dir/rm"
 chmod +x "$shim2_dir/rm"
 
 mkdir -p "$test_dir/empty"
+missing_safe_target="$test_dir/missing-safe-target"
+printf 'keep\n' >"$missing_safe_target"
 
-TMPDIR="$test_dir" REAL_RM="$real_rm_fake" PATH="$test_dir/empty:$PATH_SAFE" "$shim2_dir/rm" >/dev/null 2>"$test_dir/stderr.txt"
+TMPDIR="$test_dir" REAL_RM="$real_rm_fake" PATH="$test_dir/empty:$PATH_SAFE" "$shim2_dir/rm" "$missing_safe_target" \
+	>/dev/null 2>"$test_dir/stderr.txt"
+missing_safe_rc=$?
 
-if [[ -f "$test_dir/real-rm-called" ]]; then
-	echo "✓ Fallback rm invoked when rm-safe missing"
+if [[ $missing_safe_rc -ne 0 && -f "$missing_safe_target" && ! -f "$test_dir/real-rm-called" ]]; then
+	echo "✓ rm shadow refuses a permanent-deletion fallback"
 else
-	echo "✗ Fallback rm not invoked" >&2
+	echo "✗ rm shadow fell back to permanent deletion" >&2
 	((fails++))
 fi
 
-if grep -q "rm-safe not found" "$test_dir/stderr.txt"; then
-	echo "✓ Warning emitted when rm-safe missing"
+if grep -q "refusing to permanently delete" "$test_dir/stderr.txt"; then
+	echo "✓ Refusal explains the missing safe implementation"
 else
-	echo "✗ Warning missing when rm-safe absent" >&2
+	echo "✗ Refusal message missing when rm-safe is absent" >&2
 	((fails++))
 fi
 
@@ -239,6 +244,135 @@ if [[ -f "$test_dir/rmdir-hostile-called" ]]; then
 	echo "✓ rmdir shadow ignores an inherited find function"
 else
 	echo "✗ rmdir shadow obeyed an inherited find function" >&2
+	((fails++))
+fi
+
+# Test 10: find shadow maps a terminal -delete onto the safe per-path action.
+((tests++))
+find_work="$test_dir/find work"
+find_xdg="$test_dir/find-xdg"
+find_purge="$find_work/purge
+file"
+find_keep="$find_work/keep"
+mkdir -p "$find_work" "$find_xdg"
+printf 'trash me\n' >"$find_purge"
+printf 'keep me\n' >"$find_keep"
+real_find=$(type -P find)
+XDG_DATA_HOME="$find_xdg" RM_SAFE_BIN="$REPO_ROOT/bin/rm-safe.bash" \
+	RM_SAFE_QUIET=1 REAL_FIND="$real_find" PATH="$PATH_SAFE" \
+	"$FIND_SHIM" "$find_work" -type f -name 'purge*' -delete \
+	>"$test_dir/find-out.txt" 2>"$test_dir/find-err.txt"
+find_delete_rc=$?
+if [[ $find_delete_rc -eq 0 && ! -e "$find_purge" && -f "$find_keep" \
+	&& -f "$find_xdg/Trash/files/${find_purge##*/}" ]]; then
+	echo "✓ find shadow trashes a terminal -delete match"
+else
+	echo "✗ find shadow did not safely emulate a terminal -delete" >&2
+	((fails++))
+fi
+
+# Test 11: every unsupported -delete expression shape is rejected before real find runs.
+((tests++))
+find_complex="$test_dir/find complex"
+mkdir -p "$find_complex"
+printf 'keep\n' >"$find_complex/keep"
+find_reject_failures=0
+check_find_reject() {
+	local label=$1
+	shift
+	REAL_FIND="$real_find" PATH="$PATH_SAFE" "$FIND_SHIM" "$find_complex" "$@" \
+		>"$test_dir/find-reject-$label-out.txt" 2>"$test_dir/find-reject-$label-err.txt"
+	local rc=$?
+	if [[ $rc -eq 0 || ! -f "$find_complex/keep" \
+		|| $(grep -c "cannot safely emulate -delete" "$test_dir/find-reject-$label-err.txt") -ne 1 ]]; then
+		echo "✗ find shadow accepted $label" >&2
+		((find_reject_failures++))
+	fi
+}
+check_find_reject boolean-or -delete -o -print
+check_find_reject boolean-and -type f -a -delete
+check_find_reject boolean-not ! -name no-match -delete
+check_find_reject prune -prune -delete
+check_find_reject duplicate -delete -delete
+check_find_reject non-terminal -delete -type f
+check_find_reject unknown-primary -samefile "$find_complex/keep" -delete
+if [[ $find_reject_failures -eq 0 ]]; then
+	echo "✓ find shadow rejects all unsupported -delete expression shapes"
+else
+	echo "✗ find shadow accepted an unsupported -delete expression shape" >&2
+	((fails++))
+fi
+
+# Test 12: an undeletable matched directory makes the whole find command fail.
+((tests++))
+find_dirs="$test_dir/find dirs"
+find_empty_dir="$find_dirs/empty"
+find_nonempty_dir="$find_dirs/nonempty"
+mkdir -p "$find_empty_dir" "$find_nonempty_dir"
+printf 'keep\n' >"$find_nonempty_dir/child"
+XDG_DATA_HOME="$find_xdg" RM_SAFE_BIN="$REPO_ROOT/bin/rm-safe.bash" \
+	RM_SAFE_QUIET=1 REAL_FIND="$real_find" PATH="$PATH_SAFE" \
+	"$FIND_SHIM" "$find_dirs" -type d -delete \
+	>"$test_dir/find-dirs-out.txt" 2>"$test_dir/find-dirs-err.txt"
+find_dirs_rc=$?
+if [[ $find_dirs_rc -ne 0 && ! -e "$find_empty_dir" \
+	&& -f "$find_nonempty_dir/child" \
+	&& -d "$find_xdg/Trash/files/empty" ]]; then
+	echo "✓ find shadow reports a failed safe deletion"
+else
+	echo "✗ find shadow hid a failed safe deletion" >&2
+	((fails++))
+fi
+
+# Test 13: a search without -delete is delegated to real find unchanged.
+((tests++))
+find_passthrough="$test_dir/find passthrough"
+mkdir -p "$find_passthrough"
+printf 'keep\n' >"$find_passthrough/keep"
+REAL_FIND="$real_find" PATH="$PATH_SAFE" "$FIND_SHIM" "$find_passthrough" -type f -print \
+	>"$test_dir/find-passthrough-out.txt" 2>"$test_dir/find-passthrough-err.txt"
+find_passthrough_rc=$?
+find_passthrough_out=$(cat "$test_dir/find-passthrough-out.txt")
+if [[ $find_passthrough_rc -eq 0 && $find_passthrough_out == "$find_passthrough/keep" \
+	&& -f "$find_passthrough/keep" ]]; then
+	echo "✓ find shadow delegates ordinary searches unchanged"
+else
+	echo "✗ find shadow changed an ordinary search" >&2
+	((fails++))
+fi
+
+# Test 14: a literal -delete used as a predicate argument is not an action.
+((tests++))
+find_argument="$test_dir/find argument"
+mkdir -p "$find_argument"
+printf 'pattern\n' >"$find_argument/-delete"
+printf 'must survive\n' >"$find_argument/-depth"
+REAL_FIND="$real_find" PATH="$PATH_SAFE" "$FIND_SHIM" "$find_argument" -name -delete \
+	>"$test_dir/find-argument-out.txt" 2>"$test_dir/find-argument-err.txt"
+find_argument_rc=$?
+find_argument_out=$(cat "$test_dir/find-argument-out.txt")
+if [[ $find_argument_rc -eq 0 && $find_argument_out == "$find_argument/-delete" \
+	&& -f "$find_argument/-delete" && -f "$find_argument/-depth" ]]; then
+	echo "✓ find shadow does not mistake a predicate argument for -delete"
+else
+	echo "✗ find shadow mistook a predicate argument for -delete" >&2
+	((fails++))
+fi
+
+# Test 15: without REAL_FIND, a PATH entry after this shim supplies real find.
+((tests++))
+find_resolver="$test_dir/find resolver"
+mkdir -p "$find_resolver"
+printf 'keep\n' >"$find_resolver/keep"
+REAL_FIND= PATH="$REPO_ROOT/bin:$NO_LUAJIT_PATH" "$FIND_SHIM" "$find_resolver" -type f -print \
+	>"$test_dir/find-resolver-out.txt" 2>"$test_dir/find-resolver-err.txt"
+find_resolver_rc=$?
+find_resolver_out=$(cat "$test_dir/find-resolver-out.txt")
+if [[ $find_resolver_rc -eq 0 && $find_resolver_out == "$find_resolver/keep" \
+	&& -f "$find_resolver/keep" ]]; then
+	echo "✓ find shadow resolves real find from a later PATH entry"
+else
+	echo "✗ find shadow failed to resolve real find from PATH" >&2
 	((fails++))
 fi
 

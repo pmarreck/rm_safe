@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # rm override shim: routes to the luajit rm-safe (fast) or rm-safe.bash
-# (universal), honoring an explicit RM_SAFE_BIN override; falls back to system rm.
+# (universal), honoring an explicit RM_SAFE_BIN override; fails closed if
+# neither safe implementation is available.
 
 REAL_RM=${REAL_RM:-/bin/rm}
 SELF_PATH=${BASH_SOURCE[0]:-$0}
@@ -39,14 +40,7 @@ if [[ -x $BASH_IMPL ]]; then
 	exec "$BASH_IMPL" "$@"
 fi
 
-# 4. Last resort: system rm.
-echo "rm override: rm-safe not found in PATH; using system rm" >&2
-if [[ -n $REAL_RM && -x $REAL_RM && $REAL_RM != "$SELF_PATH" ]]; then
-	exec "$REAL_RM" "$@"
-elif [[ -x /usr/bin/rm ]]; then
-	exec /usr/bin/rm "$@"
-elif [[ -x /bin/rm ]]; then
-	exec /bin/rm "$@"
-else
-	exec command -p rm "$@"
-fi
+# 4. Fail closed. Falling back to system rm would make a partial install a
+# silent permanent-deletion path, defeating the shadow's purpose.
+echo "rm override: rm-safe not found; refusing to permanently delete files" >&2
+exit 1

@@ -56,6 +56,7 @@
               cp bin/rm-safe.bash $out/bin/rm-safe.bash
               cp bin/rm $out/bin/rm
               cp bin/rmdir $out/bin/rmdir
+              cp bin/find $out/bin/find
               makeWrapper ${pkgs.luajit}/bin/luajit $out/bin/rm-safe \
                 --add-flags $out/bin/rm-safe-luajit \
                 --prefix PATH : ${lib.makeBinPath runtimeDeps}
@@ -67,6 +68,9 @@
               wrapProgram $out/bin/rm \
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
               wrapProgram $out/bin/rmdir \
+                --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+              wrapProgram $out/bin/find \
+                --set REAL_FIND ${pkgs.findutils}/bin/find \
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
             '';
           };

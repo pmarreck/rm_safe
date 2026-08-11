@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+
+# find override shim: pass ordinary searches through unchanged, but replace the
+# approved terminal -delete subset with depth-first NUL-delimited paths.  The
+# sink dispatches every path to the appropriate safe shadow and returns failure
+# when any deletion cannot be completed.
+
+set -u
+
+SELF_PATH=${BASH_SOURCE[0]:-$0}
+if [[ $SELF_PATH != /* ]]; then
+	resolved_self=$(type -P "$SELF_PATH" 2>/dev/null || true)
+	[[ -n $resolved_self ]] && SELF_PATH=$resolved_self
+fi
+HERE=$(cd "$(dirname "$SELF_PATH")" 2>/dev/null && pwd || echo "")
+
+fail() {
+	echo "find override: $*" >&2
+	exit 1
+}
+
+is_self() {
+	[[ -e $1 && $1 -ef $SELF_PATH ]]
+}
+
+resolve_real_find() {
+	local candidate
+	if [[ -n ${REAL_FIND:-} ]]; then
+		if [[ -x $REAL_FIND ]] && ! is_self "$REAL_FIND"; then
+			printf '%s' "$REAL_FIND"
+			return 0
+		fi
+		return 1
+	fi
+
+	candidate=$(type -P gfind 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
+		printf '%s' "$candidate"
+		return 0
+	fi
+	# `type -P` chooses the first entry, which may be this shadow. Walk all
+	# executable PATH entries so Nix and other non-FHS installations work too.
+	while IFS= read -r candidate; do
+		if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done < <(type -aP find 2>/dev/null)
+	for candidate in /usr/bin/find /bin/find; do
+		if [[ -x $candidate ]] && ! is_self "$candidate"; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+safe_delete_paths() {
+	local path status=0
+	while IFS= read -r -d '' path; do
+		# A real directory must go through rmdir. rm-safe -r would widen a
+		# failed rmdir into a recursive tree move when unmatched children remain.
+		if [[ -d $path && ! -L $path ]]; then
+			[[ -x $HERE/rmdir ]] || fail "rmdir shadow is unavailable"
+			"$HERE/rmdir" -- "$path" || status=1
+		else
+			[[ -x $HERE/rm ]] || fail "rm shadow is unavailable"
+			"$HERE/rm" -- "$path" || status=1
+		fi
+	done
+	return "$status"
+}
+
+# Distinguish the -delete action from the same literal used as an argument,
+# such as `find . -name -delete`. We intentionally understand only the
+# implicit-AND grammar we emulate; an unknown primary makes a deletion request
+# ambiguous and is rejected before real find runs.
+analyze_delete_expression() {
+	local i=0 token expression_start=${#args[@]}
+	delete_count=0
+	delete_index=-1
+	has_boolean_syntax=false
+	has_unknown_primary=false
+	literal_delete_count=0
+
+	for token in "${args[@]}"; do
+		[[ $token == -delete ]] && ((literal_delete_count++))
+	done
+
+	# Find accepts path operands before its expression. A path beginning with a
+	# dash must be written with a prefix such as ./, which also keeps this split
+	# unambiguous for the safe subset.
+	while [[ $i -lt ${#args[@]} ]]; do
+		token=${args[$i]}
+		case $token in
+			-H|-L|-P) ((i++)) ;;
+			-D) ((i += 2)) ;;
+			-O*) ((i++)) ;;
+			-*|!|\(|\)|,)
+				expression_start=$i
+				break
+				;;
+			*) ((i++)) ;;
+		esac
+	done
+
+	i=$expression_start
+	while [[ $i -lt ${#args[@]} ]]; do
+		token=${args[$i]}
+		case $token in
+			-delete)
+				((delete_count++))
+				delete_index=$i
+				((i++))
+				;;
+			-o|-or|-a|-and|!|-not|\(|\)|,|-prune)
+				has_boolean_syntax=true
+				((i++))
+				;;
+			-name|-iname|-path|-ipath|-lname|-ilname|-regex|-iregex|-type|-xtype|-user|-group|-uid|-gid|-perm|-links|-size|-inum|-atime|-ctime|-mtime|-amin|-cmin|-mmin|-used|-fstype|-newer|-anewer|-cnewer|-mnewer|-newer??|-maxdepth|-mindepth|-regextype|-printf|-fprint|-fprint0|-fls)
+				((i += 2))
+				;;
+			-exec|-execdir|-ok|-okdir)
+				((i++))
+				while [[ $i -lt ${#args[@]} && ${args[$i]} != ';' && ${args[$i]} != '+' ]]; do
+					((i++))
+				done
+				if [[ $i -ge ${#args[@]} ]]; then
+					has_unknown_primary=true
+				else
+					((i++))
+				fi
+				;;
+			-daystart|-depth|-empty|-executable|-false|-follow|-ignore_readdir_race|-mount|-noleaf|-nowarn|-print|-print0|-quit|-readable|-true|-warn|-writable|-xdev)
+				((i++))
+				;;
+			*)
+				has_unknown_primary=true
+				((i++))
+				;;
+		esac
+	done
+}
+
+args=("$@")
+analyze_delete_expression
+
+real_find=$(resolve_real_find) || fail "real find is unavailable"
+if [[ $delete_count -eq 0 && $literal_delete_count -eq 0 ]]; then
+	exec "$real_find" "${args[@]}"
+fi
+
+if [[ $delete_count -eq 0 && $has_unknown_primary == false ]]; then
+	# Every literal -delete was consumed as an argument of a primary we
+	# understand, so this is an ordinary non-deleting search.
+	exec "$real_find" "${args[@]}"
+fi
+
+if [[ $delete_count -ne 1 || $delete_index -ne $((${#args[@]} - 1)) \
+	|| $has_boolean_syntax == true || $has_unknown_primary == true ]]; then
+	fail "cannot safely emulate -delete outside one terminal implicit-AND expression"
+fi
+
+rewritten=()
+for ((i=0; i<${#args[@]}; i++)); do
+	if [[ $i -eq $delete_index ]]; then
+		rewritten+=(-depth -print0)
+	else
+		rewritten+=("${args[$i]}")
+	fi
+done
+"$real_find" "${rewritten[@]}" | safe_delete_paths
+pipeline_status=("${PIPESTATUS[@]}")
+if [[ ${pipeline_status[0]} -ne 0 || ${pipeline_status[1]} -ne 0 ]]; then
+	exit 1
+fi
