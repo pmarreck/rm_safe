@@ -43,11 +43,14 @@ fi
 # Prefer g-prefixed GNU tools (macOS coreutils-prefixed) when present, else the
 # plain binary. Keeps GNU intent explicit; plain names are used on Linux/BSD.
 _resolve_tool() { # $1 = g-name, $2 = plain name -> echoes a usable command name
-	if command -v "$1" >/dev/null 2>&1; then printf '%s' "$1"; else printf '%s' "$2"; fi
+	local resolved
+	resolved=$(type -P "$1" 2>/dev/null) || resolved=$(type -P "$2" 2>/dev/null) || return 1
+	printf '%s' "$resolved"
 }
 GMKTEMP=$(_resolve_tool gmktemp mktemp)
 GMV=$(_resolve_tool gmv mv)
 GMKDIR=$(_resolve_tool gmkdir mkdir)
+GFIND=$(_resolve_tool gfind find)
 
 # mktemp -d: GNU accepts --tmpdir; BSD needs a full template path. Probe once.
 if "$GMKTEMP" --version >/dev/null 2>&1; then
@@ -312,7 +315,7 @@ reverse_log_lines() {
 	[[ -z $LOG_DIR || ! -d $LOG_DIR ]] && return 1
 	# `sort -r` gives lexicographic descending; because filenames begin
 	# with epoch-ns, that's equivalent to newest-first.
-	find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null \
+	"$GFIND" "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null \
 		| sort -r \
 		| xargs cat 2>/dev/null
 }

@@ -7,6 +7,7 @@ tests=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RM_SHIM="$REPO_ROOT/bin/rm"
+RMDIR_SHIM="$REPO_ROOT/bin/rmdir"
 SELF="$RM_SHIM"
 
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rm-override-test.XXXXXX")
@@ -35,8 +36,8 @@ chmod +x "$LUAJIT_STUB_DIR/luajit"
 # symlink-only overlay instead: the tools the shim needs, and no luajit.
 NO_LUAJIT_DIR="$test_dir/no_luajit"
 mkdir -p "$NO_LUAJIT_DIR"
-for _c in bash dirname; do
-	_p=$(PATH="$PATH_SAFE" command -v "$_c" 2>/dev/null)
+for _c in bash dirname find; do
+	_p=$(PATH="$PATH_SAFE" type -P "$_c" 2>/dev/null)
 	[[ -n $_p ]] && ln -sf -- "$_p" "$NO_LUAJIT_DIR/$_c"
 done
 NO_LUAJIT_PATH="$NO_LUAJIT_DIR"
@@ -161,6 +162,83 @@ if [[ -f "$test_dir/bash-impl-called" ]] && ! grep -q "luajit not found" "$test_
 	echo "✓ RM_SAFE_QUIET suppresses the warning"
 else
 	echo "✗ RM_SAFE_QUIET did not suppress warning" >&2
+	((fails++))
+fi
+
+# Test 6: rmdir shadow moves an empty directory to Trash without deleting it.
+((tests++))
+rmdir_empty="$test_dir/rmdir empty"
+rmdir_xdg="$test_dir/rmdir-xdg"
+mkdir -p "$rmdir_empty" "$rmdir_xdg"
+XDG_DATA_HOME="$rmdir_xdg" RM_SAFE_BIN="$REPO_ROOT/bin/rm-safe.bash" \
+	RM_SAFE_QUIET=1 PATH="$PATH_SAFE" "$RMDIR_SHIM" "$rmdir_empty" \
+	>"$test_dir/rmdir-out.txt" 2>"$test_dir/rmdir-err.txt"
+if [[ ! -e "$rmdir_empty" && -d "$rmdir_xdg/Trash/files/rmdir empty" ]]; then
+	echo "✓ rmdir shadow moves an empty directory to Trash"
+else
+	echo "✗ rmdir shadow did not move an empty directory to Trash" >&2
+	((fails++))
+fi
+
+# Test 7: rmdir must retain its non-recursive boundary for non-empty directories.
+((tests++))
+rmdir_nonempty="$test_dir/rmdir nonempty"
+mkdir -p "$rmdir_nonempty"
+printf 'keep\n' >"$rmdir_nonempty/child"
+XDG_DATA_HOME="$rmdir_xdg" RM_SAFE_BIN="$REPO_ROOT/bin/rm-safe.bash" \
+	RM_SAFE_QUIET=1 PATH="$PATH_SAFE" "$RMDIR_SHIM" "$rmdir_nonempty" \
+	>"$test_dir/rmdir-nonempty-out.txt" 2>"$test_dir/rmdir-nonempty-err.txt"
+rmdir_nonempty_rc=$?
+if [[ $rmdir_nonempty_rc -ne 0 && -f "$rmdir_nonempty/child" \
+	&& ! -e "$rmdir_xdg/Trash/files/rmdir nonempty" \
+	&& $(grep -c "Directory not empty" "$test_dir/rmdir-nonempty-err.txt") -eq 1 ]]; then
+	echo "✓ rmdir shadow rejects a non-empty directory"
+else
+	echo "✗ rmdir shadow accepted a non-empty directory" >&2
+	((fails++))
+fi
+
+# Test 8: a partial install must refuse rather than fall back to system rmdir.
+((tests++))
+isolated_rmdir_dir="$test_dir/rmdir-isolated"
+isolated_rmdir="$isolated_rmdir_dir/rmdir"
+rmdir_no_safe="$test_dir/rmdir no safe"
+mkdir -p "$isolated_rmdir_dir"
+cp "$RMDIR_SHIM" "$isolated_rmdir"
+chmod +x "$isolated_rmdir"
+mkdir -p "$rmdir_no_safe"
+TMPDIR="$test_dir" PATH="$NO_LUAJIT_PATH" "$isolated_rmdir" "$rmdir_no_safe" \
+	>"$test_dir/rmdir-no-safe-out.txt" 2>"$test_dir/rmdir-no-safe-err.txt"
+rmdir_no_safe_rc=$?
+if [[ $rmdir_no_safe_rc -ne 0 && -d "$rmdir_no_safe" \
+	&& $(grep -c "refusing to permanently delete" "$test_dir/rmdir-no-safe-err.txt") -eq 1 ]]; then
+	echo "✓ rmdir shadow refuses a permanent-deletion fallback"
+else
+	echo "✗ rmdir shadow fell back to permanent deletion" >&2
+	((fails++))
+fi
+
+# Test 9: inherited shell functions must not replace rmdir's find executable.
+((tests++))
+hostile_find_env="$test_dir/hostile-find.bashenv"
+hostile_rmdir_safe="$test_dir/hostile-rmdir-safe"
+rmdir_hostile="$test_dir/rmdir hostile find"
+cat >"$hostile_find_env" <<'EOF'
+find() { return 127; }
+EOF
+cat >"$hostile_rmdir_safe" <<'EOF'
+#!/bin/sh
+printf 'called\n' >"$TMPDIR/rmdir-hostile-called"
+EOF
+chmod +x "$hostile_rmdir_safe"
+mkdir -p "$rmdir_hostile"
+TMPDIR="$test_dir" BASH_ENV="$hostile_find_env" RM_SAFE_BIN="$hostile_rmdir_safe" \
+	PATH="$NO_LUAJIT_PATH" "$RMDIR_SHIM" "$rmdir_hostile" \
+	>"$test_dir/rmdir-hostile-out.txt" 2>"$test_dir/rmdir-hostile-err.txt"
+if [[ -f "$test_dir/rmdir-hostile-called" ]]; then
+	echo "✓ rmdir shadow ignores an inherited find function"
+else
+	echo "✗ rmdir shadow obeyed an inherited find function" >&2
 	((fails++))
 fi
 

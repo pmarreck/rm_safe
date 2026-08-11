@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+# rmdir override shim: move verified-empty directories to Trash via rm-safe.
+# It deliberately rejects rmdir-specific options whose semantics cannot be
+# preserved by a single trash move (such as --parents) rather than broadening
+# them into recursive deletion.
+
+set -u
+
+SELF_PATH=${BASH_SOURCE[0]:-$0}
+HERE=$(cd "$(dirname "$SELF_PATH")" 2>/dev/null && pwd || echo "")
+
+show_help() {
+	cat <<'EOF'
+Usage: rmdir [--verbose] [--] DIRECTORY...
+
+Moves empty directories to Trash through rm-safe.  Rejects non-empty
+directories and unsupported rmdir-specific options to retain rmdir's
+non-recursive safety boundary.
+EOF
+}
+
+verbose=false
+operands=()
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--) shift; operands+=("$@"); break ;;
+		-v|--verbose) verbose=true ;;
+		-h|--help) show_help; exit 0 ;;
+		-*)
+			echo "rmdir override: unsupported option '$1'; refusing to change rmdir semantics" >&2
+			exit 2
+			;;
+		*) operands+=("$1") ;;
+	esac
+	shift
+done
+
+if [[ ${#operands[@]} -eq 0 ]]; then
+	echo "rmdir override: missing operand" >&2
+	exit 1
+fi
+
+find_cmd=$(type -P gfind 2>/dev/null || type -P find 2>/dev/null || true)
+if [[ -z $find_cmd ]]; then
+	echo "rmdir override: find is unavailable; refusing to inspect directories" >&2
+	exit 1
+fi
+
+# Verify every operand before moving any.  Moving a directory that has
+# children would turn an ordinary rmdir call into a recursive operation.
+for operand in "${operands[@]}"; do
+	if [[ -L $operand || ! -d $operand ]]; then
+		echo "rmdir override: '$operand': Not a directory" >&2
+		exit 1
+	fi
+
+	contents=$("$find_cmd" "$operand" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)
+	find_status=$?
+	if [[ $find_status -ne 0 ]]; then
+		echo "rmdir override: '$operand': Cannot verify directory contents" >&2
+		exit 1
+	fi
+	if [[ -n $contents ]]; then
+		echo "rmdir override: '$operand': Directory not empty" >&2
+		exit 1
+	fi
+done
+
+# Match bin/rm's implementation selection, except there is deliberately no
+# system-rmdir fallback: that would silently reintroduce permanent deletion.
+safe_impl=""
+if [[ -n ${RM_SAFE_BIN:-} ]]; then
+	if [[ -x $RM_SAFE_BIN && ! $RM_SAFE_BIN -ef $SELF_PATH ]]; then
+		safe_impl=$RM_SAFE_BIN
+	else
+		echo "rmdir override: RM_SAFE_BIN=$RM_SAFE_BIN is unusable; ignoring" >&2
+	fi
+fi
+
+if [[ -z $safe_impl ]]; then
+	candidate=$(command -v rm-safe 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate && ! $candidate -ef $SELF_PATH ]] \
+		&& command -v luajit >/dev/null 2>&1; then
+		safe_impl=$candidate
+	fi
+fi
+
+if [[ -z $safe_impl && -x $HERE/rm-safe.bash ]]; then
+	safe_impl=$HERE/rm-safe.bash
+fi
+
+if [[ -z $safe_impl ]]; then
+	echo "rmdir override: rm-safe not found; refusing to permanently delete directories" >&2
+	exit 1
+fi
+
+rm_safe_args=(-r)
+[[ $verbose == true ]] && rm_safe_args+=(-v)
+exec "$safe_impl" "${rm_safe_args[@]}" -- "${operands[@]}"

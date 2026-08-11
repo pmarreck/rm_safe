@@ -13,8 +13,9 @@
 	- run_tests: integrated runner that executes external test suites.
 - bin/rm-safe.bash: Preserved Bash baseline implementation for comparison benchmarks and rollback safety.
 - bin/rm: Shim that routes rm -> rm-safe with fallback to system rm.
+- bin/rmdir: Shim that resolves find to an executable path, verifies every operand is an empty real directory, then routes it to rm-safe with -r; refuses unsupported rmdir-only options and any system-rmdir fallback.
 - bin/test/rm-safe_test: Undo/restore tests and picker interaction tests.
 	- Includes symlink-only PATH overlay helper to force `gum`-missing/`fzf`-present behavior even when both tools share one directory (common on Nix).
-- bin/test/rm_override_test: Shim behavior tests.
+- bin/test/rm_override_test: rm/rmdir shim behavior tests, including empty-directory Trash moves, non-empty rejection, and fail-closed partial installs.
 - bin/test/fs_shim_test: Proves bin/rm-safe carries no lfs dependency. Three controls: static (no lfs in live code), differential (extracted shim vs real lfs over a file-type corpus, plus oracle-free invariants like every directory yielding "." and ".."), and end-to-end trash/undo round trips under a poisoned `require` and a genuinely bare luajit. RM_SAFE_IMPL env knob points it at a mutated copy for mutation testing.
 - bin/test/capture.bash: capture() helper to collect stdout/stderr/rc for tests.

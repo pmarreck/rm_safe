@@ -55,6 +55,7 @@
               cp bin/rm-safe $out/bin/rm-safe-luajit
               cp bin/rm-safe.bash $out/bin/rm-safe.bash
               cp bin/rm $out/bin/rm
+              cp bin/rmdir $out/bin/rmdir
               makeWrapper ${pkgs.luajit}/bin/luajit $out/bin/rm-safe \
                 --add-flags $out/bin/rm-safe-luajit \
                 --prefix PATH : ${lib.makeBinPath runtimeDeps}
@@ -64,6 +65,8 @@
               # ($out/bin holds rm-safe + rm-safe.bash) and the runtime tools;
               # otherwise it would always fall back to the slower bash impl.
               wrapProgram $out/bin/rm \
+                --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
+              wrapProgram $out/bin/rmdir \
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
             '';
           };

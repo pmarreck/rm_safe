@@ -228,7 +228,32 @@ else
 	fi
 fi
 
-# Test 2: --undo -2 restores the second-to-last TRASH_MANUAL
+# Test 2: Bash undo ignores an inherited find shell function.
+# The implementation receives a synthetic HOME in this suite. An exported
+# function that resolves find through $HOME must not hide its log fragments.
+reset_trash
+((tests++))
+hostile_find_env="$TEST_DIR/hostile-find.bashenv"
+cat >"$hostile_find_env" <<'EOF'
+find() { return 127; }
+EOF
+echo "find-safe" >"$WORK_DIR/find-safe"
+out=""; err=""; rc=0
+capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" \
+	BASH_ENV="$hostile_find_env" "$REPO_ROOT/bin/rm-safe.bash" "$WORK_DIR/find-safe"
+hostile_find_trash_rc=$rc
+capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" \
+	BASH_ENV="$hostile_find_env" "$REPO_ROOT/bin/rm-safe.bash" --undo
+hostile_find_undo_rc=$rc
+if [[ $hostile_find_trash_rc -eq 0 && $hostile_find_undo_rc -eq 0 && -f "$WORK_DIR/find-safe" ]]; then
+	echo "OK bash undo ignores an inherited find function"
+else
+	echo "FAIL bash undo obeyed an inherited find function" >&2
+	printf '%s\n' "$err" >&2
+	((fails++))
+fi
+
+# Test 3: --undo -2 restores the second-to-last TRASH_MANUAL
 reset_trash
 ((tests++))
 echo "a" >"$WORK_DIR/fileA"

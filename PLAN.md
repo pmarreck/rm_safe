@@ -1,5 +1,61 @@
 # Plan
 
+## Active
+
+Goal: protect ordinary `rmdir` invocations with an installable shadow that moves
+empty directories to Trash, while retaining `rmdir`'s non-recursive safety
+contract. Done when the package installs the shadow, documentation tells users
+to put it on `PATH`, and an integration test proves it intercepts an empty
+directory without accepting a non-empty one.
+
+- [x] Add a RED integration case for a shadowed `rmdir`; it proves the empty
+      Trash move and non-empty rejection. (2026-08-11 13:06 EDT)
+- [x] Implement and package the `rmdir` shadow with fail-closed safe-implementation
+      selection; unsupported rmdir-specific options cannot broaden the operation.
+      (2026-08-11 13:06 EDT)
+- [x] Update installation and file documentation, annotate new paths, and run
+      the full local matrix plus sealed Nix check and package smoke.
+      (2026-08-11 13:08 EDT)
+- [x] Audit remaining destructive command surfaces. Priority paths are `unlink`,
+      `find -delete`, the current `rm` system fallback, `shred`/`gshred`,
+      `truncate`, `dd`, `rsync --delete`, and Git cleanup commands. Shadows
+      cannot cover shell redirections, absolute paths, interpreter APIs, or
+      direct syscalls. (2026-08-11 13:10 EDT)
+- [x] Select the protection boundary with Peter: humans get command shadows;
+      `rm` fails closed; `find` emulates only one terminal `-delete` with
+      simple implicit-AND predicates; interpreter and syscall paths remain
+      outside this layer. (2026-08-11 15:20 EDT)
+- [x] Scope the next safeguards with Peter: leave `shred`/`gshred`,
+      `rsync --delete`, and Git cleanup out of scope; treat human command-line
+      protection as a first-class goal rather than relying only on agent gates.
+      (2026-08-11 13:43 EDT)
+- [ ] Specify and reproduce `find -delete` semantics before rewriting it to a
+      null-delimited `rm-safe` input stream. Curiosity poke: `-delete` is both
+      a deletion action and a true expression predicate, so a token replacement
+      can alter `find`'s Boolean expression or directory traversal.
+- [ ] Add a RED fail-closed `rm` case, then remove its system-rm fallback.
+      Curiosity poke: a copied shim without either safe implementation must
+      leave its target untouched even when `REAL_RM` is configured.
+- [ ] Implement the approved `find -delete` subset with a NUL-delimited sink
+      that dispatches files/symlinks to `rm-safe` and directories to `rmdir`.
+      Reject Boolean expressions and duplicate or non-terminal `-delete`
+      actions before invoking the real `find`.
+- [ ] Add a RED `truncate` guard: shrinking an existing file reports current
+      and requested byte counts and requires an explicit `--confirm`; growing
+      files and no-op sizes retain ordinary behavior.
+- [ ] Add a RED `dd` guard: overwriting an existing output, special file, or
+      mountpoint reports the resolved target and requested transfer parameters,
+      then requires `--confirm`. Curiosity poke: `dd` option aliases, operand
+      order, and unbounded input make an exact byte forecast unavailable.
+- [ ] Decide whether `unlink` should join the safe-trash surface and whether
+      `bin/rm` should fail closed when no safe implementation is available.
+- [ ] Commit the verified rmdir unit after the audit decision.
+
+Found in the full gate: an inherited Bash `find` function could hide log
+fragments after `HOME` isolation, breaking Bash `--undo`. Executable-path
+resolvers and hostile-function regressions now keep that ambient shell state
+out of the Bash implementation and `rmdir` shadow. (2026-08-11 13:06 EDT)
+
 Goal (done): remove the `luafilesystem` (lfs) dependency from `bin/rm-safe` so
 the LuaJIT implementation runs under ANY luajit — bare or stocked. It used to
 die with `module 'lfs' not found` inside any flake dev shell that puts a bare
