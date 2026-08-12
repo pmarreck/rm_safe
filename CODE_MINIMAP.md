@@ -13,8 +13,8 @@
 	- run_tests: integrated runner that executes external test suites.
 - bin/rm-safe.bash: Preserved Bash baseline implementation for comparison benchmarks and rollback safety.
 - bin/rm: Shim that routes rm -> rm-safe and refuses to call system rm when no safe implementation is available.
-- bin/rmdir: Shim that resolves find to an executable path, verifies every operand is an empty real directory, then routes it to rm-safe with -r; refuses unsupported rmdir-only options and any system-rmdir fallback.
-- bin/find: Shim that passes ordinary searches to real find and transforms one terminal implicit-AND -delete expression into depth-first NUL-delimited paths consumed by the rm/rmdir shadows; reports any failed safe deletion.
+- bin/rmdir: Shim that resolves an explicit, g-prefixed, or standard system find binary, verifies every operand is an empty real directory, then routes it to rm-safe with -r; refuses unsupported rmdir-only options and any system-rmdir fallback.
+- bin/find: Shim that resolves an explicit, g-prefixed, or standard system find binary, refuses re-entry through another shadow, and transforms one terminal implicit-AND -delete expression into depth-first NUL-delimited paths consumed by the rm/rmdir shadows; reports any failed safe deletion.
 - bin/truncate: Shim that preflights existing regular-file sizes, forecasts byte loss from supported size forms, and requires `--confirm` for shrinking or unprovable resize requests.
 - bin/dd: Shim that preflights existing `of=` targets, reports target type and requested transfer bounds, and requires `--confirm` before delegating an overwrite.
 - bin/test/rm-safe_test: Undo/restore tests and picker interaction tests.

@@ -361,7 +361,7 @@ else
 	((fails++))
 fi
 
-# Test 15: without REAL_FIND, a PATH entry after this shim supplies real find.
+# Test 15: without REAL_FIND, the system real find supplies an ordinary search.
 ((tests++))
 find_resolver="$test_dir/find resolver"
 mkdir -p "$find_resolver"
@@ -372,9 +372,9 @@ find_resolver_rc=$?
 find_resolver_out=$(cat "$test_dir/find-resolver-out.txt")
 if [[ $find_resolver_rc -eq 0 && $find_resolver_out == "$find_resolver/keep" \
 	&& -f "$find_resolver/keep" ]]; then
-	echo "✓ find shadow resolves real find from a later PATH entry"
+	echo "✓ find shadow resolves a system real find without an override"
 else
-	echo "✗ find shadow failed to resolve real find from PATH" >&2
+	echo "✗ find shadow failed to resolve a system real find" >&2
 	((fails++))
 fi
 
@@ -611,6 +611,44 @@ if [[ $dd_resolver_rc -ne 0 && $dd_resolver_size -eq 10 \
 	echo "✓ dd shadow resolves real dd from a later PATH entry"
 else
 	echo "✗ dd shadow failed to resolve real dd from PATH" >&2
+	((fails++))
+fi
+
+# Test 29: a wrapped real find cannot re-enter this safety shadow.
+((tests++))
+find_reentry="$test_dir/find reentry"
+mkdir -p "$find_reentry"
+printf 'keep\n' >"$find_reentry/keep"
+RM_SAFE_FIND_ACTIVE=1 REAL_FIND="$real_find" PATH="$PATH_SAFE" "$FIND_SHIM" "$find_reentry" -type f -print \
+	>"$test_dir/find-reentry-out.txt" 2>"$test_dir/find-reentry-err.txt"
+find_reentry_rc=$?
+if [[ $find_reentry_rc -ne 0 \
+	&& $(grep -c "real find resolution re-entered the safety shadow" "$test_dir/find-reentry-err.txt") -eq 1 \
+	&& -f "$find_reentry/keep" ]]; then
+	echo "✓ find shadow refuses a re-entering real-find wrapper"
+else
+	echo "✗ find shadow allowed a re-entering real-find wrapper" >&2
+	((fails++))
+fi
+
+# Test 30: delegated real-find commands inherit the re-entry marker.
+((tests++))
+find_marker_probe="$test_dir/find-marker-probe"
+cat >"$find_marker_probe" <<'EOF'
+#!/bin/sh
+if [ "${RM_SAFE_FIND_ACTIVE:-}" = 1 ]; then
+	exit 73
+fi
+exit 0
+EOF
+chmod +x "$find_marker_probe"
+REAL_FIND="$find_marker_probe" PATH="$PATH_SAFE" "$FIND_SHIM" "$find_reentry" -type f -print \
+	>"$test_dir/find-marker-out.txt" 2>"$test_dir/find-marker-err.txt"
+find_marker_rc=$?
+if [[ $find_marker_rc -eq 73 && -f "$find_reentry/keep" ]]; then
+	echo "✓ find shadow marks delegated real-find commands against re-entry"
+else
+	echo "✗ find shadow did not mark delegated real-find commands" >&2
 	((fails++))
 fi
 

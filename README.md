@@ -66,6 +66,12 @@ shadow so unmatched children cannot be moved recursively. If it cannot
 unambiguously parse a `-delete` expression, it refuses to run it rather than
 guess whether `-delete` was an action or an argument.
 
+To prevent one command shadow from selecting another as its real executable,
+the shim resolves `REAL_FIND`, `gfind`, or a system `find` path. The package
+sets `REAL_FIND` automatically. A nonstandard manual installation should set
+`REAL_FIND` to the underlying executable; the shim refuses an unproved generic
+`PATH` candidate rather than risk a wrapper loop.
+
 ### Optional upgrades
 
 - **Speed:** install **luajit** and the shim automatically uses the faster
@@ -166,6 +172,7 @@ Cautions
 - The `rm` and `rmdir` shadows fail closed if no safe implementation is available. Repair the installation rather than expecting a system-command fallback.
 - The `rmdir` shadow checks emptiness before moving a directory. Coordinate concurrent writers around that check; a filesystem cannot atomically test that a directory is empty and rename it into Trash.
 - The `find` shadow rejects `-delete` expressions outside its documented subset before real find runs. A concurrent writer can still change a selected path between traversal and its safe move.
+- The `find` shadow intentionally avoids a generic later-`PATH` fallback. Set `REAL_FIND` to the underlying binary when it is not `gfind` or in a standard system location.
 - The `truncate` shadow samples file size before delegation. A concurrent writer can change a file between its forecast and the confirmed resize, so coordinate writers when exact byte preservation matters.
 - The `dd` shadow cannot know the exact number of bytes a stream will yield or protect a target changed after its forecast. Its confirmation report labels exact bounds only when the operands prove them.
 

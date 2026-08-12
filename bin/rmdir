@@ -41,7 +41,27 @@ if [[ ${#operands[@]} -eq 0 ]]; then
 	exit 1
 fi
 
-find_cmd=$(type -P gfind 2>/dev/null || type -P find 2>/dev/null || true)
+resolve_real_find() {
+	local candidate
+	if [[ -n ${REAL_FIND:-} && -x $REAL_FIND ]]; then
+		printf '%s' "$REAL_FIND"
+		return 0
+	fi
+	candidate=$(type -P gfind 2>/dev/null || true)
+	if [[ -n $candidate && -x $candidate ]]; then
+		printf '%s' "$candidate"
+		return 0
+	fi
+	for candidate in /run/current-system/sw/bin/find /usr/bin/find /bin/find; do
+		if [[ -x $candidate ]]; then
+			printf '%s' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+find_cmd=$(resolve_real_find || true)
 if [[ -z $find_cmd ]]; then
 	echo "rmdir override: find is unavailable; refusing to inspect directories" >&2
 	exit 1

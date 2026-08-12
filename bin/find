@@ -7,6 +7,14 @@
 
 set -u
 
+# A preceding command shadow can itself call `find`. Do not turn two harmless
+# wrappers into an unbounded exec/pipeline loop. The marker is exported only
+# for the delegated real-find process, never for safe per-path actions.
+if [[ ${RM_SAFE_FIND_ACTIVE:-} == 1 ]]; then
+	echo "find override: real find resolution re-entered the safety shadow" >&2
+	exit 1
+fi
+
 SELF_PATH=${BASH_SOURCE[0]:-$0}
 if [[ $SELF_PATH != /* ]]; then
 	resolved_self=$(type -P "$SELF_PATH" 2>/dev/null || true)
@@ -38,15 +46,10 @@ resolve_real_find() {
 		printf '%s' "$candidate"
 		return 0
 	fi
-	# `type -P` chooses the first entry, which may be this shadow. Walk all
-	# executable PATH entries so Nix and other non-FHS installations work too.
-	while IFS= read -r candidate; do
-		if [[ -n $candidate && -x $candidate ]] && ! is_self "$candidate"; then
-			printf '%s' "$candidate"
-			return 0
-		fi
-	done < <(type -aP find 2>/dev/null)
-	for candidate in /usr/bin/find /bin/find; do
+	# Prefer system locations over a generic PATH walk. Another safety wrapper
+	# can have a distinct pathname, so merely excluding this file cannot prove a
+	# later `find` candidate is the underlying tool.
+	for candidate in /run/current-system/sw/bin/find /usr/bin/find /bin/find; do
 		if [[ -x $candidate ]] && ! is_self "$candidate"; then
 			printf '%s' "$candidate"
 			return 0
@@ -147,13 +150,13 @@ analyze_delete_expression
 
 real_find=$(resolve_real_find) || fail "real find is unavailable"
 if [[ $delete_count -eq 0 && $literal_delete_count -eq 0 ]]; then
-	exec "$real_find" "${args[@]}"
+	RM_SAFE_FIND_ACTIVE=1 exec "$real_find" "${args[@]}"
 fi
 
 if [[ $delete_count -eq 0 && $has_unknown_primary == false ]]; then
 	# Every literal -delete was consumed as an argument of a primary we
 	# understand, so this is an ordinary non-deleting search.
-	exec "$real_find" "${args[@]}"
+	RM_SAFE_FIND_ACTIVE=1 exec "$real_find" "${args[@]}"
 fi
 
 if [[ $delete_count -ne 1 || $delete_index -ne $((${#args[@]} - 1)) \
@@ -169,7 +172,7 @@ for ((i=0; i<${#args[@]}; i++)); do
 		rewritten+=("${args[$i]}")
 	fi
 done
-"$real_find" "${rewritten[@]}" | safe_delete_paths
+RM_SAFE_FIND_ACTIVE=1 "$real_find" "${rewritten[@]}" | safe_delete_paths
 pipeline_status=("${PIPESTATUS[@]}")
 if [[ ${pipeline_status[0]} -ne 0 || ${pipeline_status[1]} -ne 0 ]]; then
 	exit 1

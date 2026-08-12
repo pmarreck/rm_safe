@@ -8,6 +8,11 @@ contract. Done when the package installs the shadow, documentation tells users
 to put it on `PATH`, and an integration test proves it intercepts an empty
 directory without accepting a non-empty one.
 
+- [x] Diagnose and stop the reported burst of `find` processes. `bin/find`
+      selected `~/bin/find` (another command wrapper), which selected this
+      shadow again; a re-entry marker, direct real-binary resolution, and an
+      `rmdir` resolver repair break the loop. (2026-08-12 EDT)
+
 - [x] Add a RED integration case for a shadowed `rmdir`; it proves the empty
       Trash move and non-empty rejection. (2026-08-11 13:06 EDT)
 - [x] Implement and package the `rmdir` shadow with fail-closed safe-implementation
@@ -55,6 +60,8 @@ directory without accepting a non-empty one.
       (2026-08-11 15:33 EDT)
 - [x] Commit the verified `truncate --confirm` unit. (2026-08-11 15:52 EDT)
 - [x] Commit the verified `dd --confirm` unit. (2026-08-11 16:04 EDT)
+- [x] Commit the verified `find` recursion incident repair.
+      (2026-08-12 11:27 EDT)
 
 Found in the full gate: an inherited Bash `find` function could hide log
 fragments after `HOME` isolation, breaking Bash `--undo`. Executable-path

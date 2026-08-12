@@ -70,6 +70,7 @@
               wrapProgram $out/bin/rm \
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
               wrapProgram $out/bin/rmdir \
+		--set REAL_FIND ${pkgs.findutils}/bin/find \
                 --prefix PATH : ${pkgs.luajit}/bin:$out/bin:${lib.makeBinPath (runtimeDeps ++ [ pkgs.bashInteractive ])}
               wrapProgram $out/bin/find \
                 --set REAL_FIND ${pkgs.findutils}/bin/find \
