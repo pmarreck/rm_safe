@@ -70,7 +70,8 @@ reset_trash() {
 # old single-file log used to give us in one `cat`.
 read_all_logs() {
 	if [[ -d "$LOG_DIR" ]]; then
-		find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f | sort | xargs cat 2>/dev/null
+		# NUL-delimited: fragment names keep spaces when printable-binary is absent.
+		find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z | xargs -0 cat 2>/dev/null
 	fi
 }
 
@@ -398,6 +399,124 @@ else
 	fi
 fi
 
+
+# Test: concurrent invocations never collide in the Trash.
+# Regression guard for an inbox report (2026-11-08): 8 parallel `rm` calls on
+# same-basename paths intermittently failed with "Failed to move ... to trash".
+# Root cause was check-then-act naming (probe for a free Trash name, THEN
+# move), so racing processes picked the same name: a file rename silently
+# clobbered another process's trashed file, and a directory move either failed
+# or nested inside the other entry. Invariants checked per round, regardless of
+# interleaving: every call exits 0, every payload survives exactly once as its
+# own top-level Trash entry, and every entry has a .trashinfo naming its origin.
+# $1 = label, $2 = parent dir for the source trees (may be another filesystem).
+concurrency_round() {
+	local label=$1 src_root=$2 n=$CONC_WORKERS round i pids rcs ok detail
+	local gate="$src_root/gate" got want entry info_path
+	ok=true; detail=""
+	for ((round = 1; round <= CONC_ROUNDS; round++)); do
+		reset_trash
+		"$REAL_RM" -rf "$src_root/w" "$gate"
+		for ((i = 1; i <= n; i++)); do
+			mkdir -p "$src_root/w/$i/same dir"
+			printf 'file-%d\n' "$i" >"$src_root/w/$i/same.txt"
+			printf 'dir-%d\n' "$i" >"$src_root/w/$i/same dir/inner"
+		done
+		pids=()
+		for ((i = 1; i <= n; i++)); do
+			# Busy-wait on a gate file (no sleeps) so all workers start together.
+			env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" bash -c '
+				until [[ -e $1 ]]; do :; done
+				exec rm-safe -rf "$2/same.txt" "$2/same dir"
+			' _ "$gate" "$src_root/w/$i" >"$src_root/out.$i" 2>&1 &
+			pids+=($!)
+		done
+		: >"$gate"
+		rcs=""
+		for ((i = 0; i < n; i++)); do
+			wait "${pids[$i]}" || rcs+=" worker$((i + 1))=$?"
+		done
+		if [[ -n $rcs ]]; then
+			ok=false; detail="round $round nonzero exits:$rcs; $(cat "$src_root"/out.* 2>/dev/null | sort -u | head -n 3)"
+			break
+		fi
+		want=$(for ((i = 1; i <= n; i++)); do printf 'dir-%d\nfile-%d\n' "$i" "$i"; done | sort)
+		got=$(for entry in "$TRASH_FILES"/*; do
+			if [[ -d $entry ]]; then cat "$entry/inner"; else cat "$entry"; fi
+		done 2>/dev/null | sort)
+		if [[ $got != "$want" ]]; then
+			ok=false; detail="round $round payloads lost/merged ($(printf '%s\n' "$got" | grep -c .) of $((2 * n)) recovered)"
+			break
+		fi
+		for entry in "$TRASH_FILES"/*; do
+			info_path="$TRASH_INFO/$(basename "$entry").trashinfo"
+			if ! grep -Eq '^Path=.*/w/[0-9]+/same(\.txt|%20dir)$' "$info_path" 2>/dev/null; then
+				ok=false; detail="round $round entry $(basename "$entry") lacks a matching .trashinfo"
+				break 2
+			fi
+		done
+		if [[ -n $(find "$TRASH_BASE" -maxdepth 1 -name '.rm-safe-staging.*' 2>/dev/null) ]]; then
+			ok=false; detail="round $round left staging directories in the Trash: $(find "$TRASH_BASE" -maxdepth 2 -path '*/.rm-safe-staging.*' 2>/dev/null | head -n 4 | tr '\n' ' ')"
+			break
+		fi
+		got=$(read_all_logs | awk -F'\t' '$3=="TRASH_MANUAL"' | grep -c .)
+		if [[ $got -ne $((2 * n)) ]]; then
+			ok=false; detail="round $round has $got TRASH_MANUAL undo records, want $((2 * n))"
+			break
+		fi
+		if [[ -n $(find "$src_root/w" -mindepth 2 2>/dev/null) ]]; then
+			ok=false; detail="round $round left sources behind"
+			break
+		fi
+	done
+	((tests++))
+	if [[ $ok == true ]]; then
+		echo "OK concurrent trashing is collision-free ($label)"
+	else
+		echo "FAIL concurrent trashing collided ($label): $detail" >&2
+		((fails++))
+	fi
+}
+
+# Test: a foreign Trash occupant is never replaced.
+# Something outside the XDG protocol (no .trashinfo) already holds the plain
+# basename in Trash/files. Placement must refuse that name atomically, release
+# its reservation, and land the item under another name with metadata.
+reset_trash
+((tests++))
+printf 'foreign\n' >"$TRASH_FILES/occupied.txt"
+printf 'ours\n' >"$WORK_DIR/occupied.txt"
+run_cmd "$WORK_DIR/occupied.txt"
+occ_entry=$(grep -lx 'ours' "$TRASH_FILES"/* 2>/dev/null | head -n 1)
+if [[ $RM_RC -eq 0 && $(cat "$TRASH_FILES/occupied.txt") == foreign \
+	&& -n $occ_entry && $occ_entry != "$TRASH_FILES/occupied.txt" \
+	&& -f "$TRASH_INFO/$(basename "$occ_entry").trashinfo" \
+	&& ! -e "$TRASH_INFO/occupied.txt.trashinfo" && ! -e "$WORK_DIR/occupied.txt" ]]; then
+	echo "OK foreign Trash occupant is preserved, item placed under a new name"
+else
+	echo "FAIL foreign Trash occupant handling (rc=$RM_RC entry=${occ_entry:-<none>})" >&2
+	printf '%s\n' "$RM_ERR" >&2
+	((fails++))
+fi
+
+CONC_WORKERS=16
+CONC_ROUNDS=3
+CONC_SAME_FS="$TEST_DIR/conc"
+mkdir -p "$CONC_SAME_FS"
+concurrency_round "same filesystem" "$CONC_SAME_FS"
+
+# Cross-device variant: sources on a different mount than the Trash, so the
+# move cannot be a single rename(2). /dev/shm is a separate tmpfs on Linux.
+CONC_XDEV=""
+if [[ -d /dev/shm && -w /dev/shm ]]; then
+	CONC_XDEV=$(mktemp -d /dev/shm/rm-safe-conc.XXXXXX 2>/dev/null || true)
+fi
+if [[ -n $CONC_XDEV ]] && [[ $(stat -c %d "$CONC_XDEV" 2>/dev/null) != "$(stat -c %d "$TEST_DIR" 2>/dev/null)" ]]; then
+	concurrency_round "cross-device" "$CONC_XDEV"
+else
+	skip_test "concurrent cross-device trashing" "no writable mount distinct from \$TMPDIR"
+fi
+[[ -n $CONC_XDEV ]] && "$REAL_RM" -rf "$CONC_XDEV"
 echo "=== Test Summary ==="
 echo "Passed: $((tests - fails - skips))"
 echo "Skipped: $skips" >&2

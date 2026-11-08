@@ -167,6 +167,10 @@ Claude Code / AI agent integration
 
   Any Bash tool call containing `rm` (but not `rm-safe`) will be rejected before execution. The agent sees the block message and retries with `rm-safe`.
 
+Concurrency
+- Any number of `rm-safe` processes may trash same-named items at once. A Trash name is reserved by creating its `.trashinfo` with `O_CREAT|O_EXCL` (the XDG Trash spec's protocol, shared with gio and trash-cli), and the item moves in with a no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS), so an existing Trash entry is never overwritten. Cross-device items are first moved into a private staging directory inside the Trash, then renamed into place atomically.
+- The bash fallback uses noclobber (`O_EXCL`) for the reservation and GNU `mv -n -T` (`RENAME_NOREPLACE`) for placement. With BSD `mv` the reservation alone arbitrates, which covers every spec-following trasher.
+
 Cautions
 - Log-rotate/cleanup scripts that expect permanent deletion will move files to trash when the shim is first in PATH; they should call `/bin/rm` explicitly if deletion is intended.
 - The `rm` and `rmdir` shadows fail closed if no safe implementation is available. Repair the installation rather than expecting a system-command fallback.

@@ -7,7 +7,27 @@ struct rmsafe_timespec { int64_t tv_sec; int64_t tv_nsec; };
 int clock_gettime(int clk_id, struct rmsafe_timespec *tp);
 int isatty(int fd);
 unsigned int geteuid(void);
+int getpid(void);
+int open(const char *path, int flags, ...);
+long write(int fd, const void *buf, unsigned long count);
+int close(int fd);
+int unlink(const char *path);
+int rmdir(const char *path);
+int rename(const char *from, const char *to);
+int linkat(int fd1, const char *from, int fd2, const char *to, int flags);
+char *mkdtemp(char *template);
 ]]
+
+-- Atomic no-replace rename: renameat2(RENAME_NOREPLACE) on Linux (glibc 2.28+),
+-- renamex_np(RENAME_EXCL) on macOS. Either refuses with EEXIST instead of
+-- silently replacing the destination, which is what makes concurrent trashing
+-- safe without a check-then-act window. Symbols are probed with pcall so an
+-- older libc degrades to the link/mkdir fallbacks in rename_noreplace().
+if ffi.os == "OSX" then
+	ffi.cdef[[int renamex_np(const char *from, const char *to, unsigned int flags);]]
+else
+	ffi.cdef[[int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags);]]
+end
 
 -- >>> RM_SAFE_FS_SHIM_BEGIN
 -- Filesystem primitives over the LuaJIT FFI, replacing luafilesystem (lfs).
@@ -453,10 +473,13 @@ local function epoch_ns_str()
 	_log_counter = _log_counter + 1
 	-- Formatting as a plain string sidesteps LuaJIT double-precision limits
 	-- (2^53 ≈ 9e15, well below sec×1e9 ≈ 2e18).
-	return string.format("%d%09d-%04d",
+	-- The PID suffix makes names unique ACROSS processes: concurrent runs can
+	-- share a nanosecond, and a shared name would overwrite an undo record.
+	return string.format("%d%09d-%04d-%d",
 		tonumber(_ts.tv_sec),
 		tonumber(_ts.tv_nsec),
-		_log_counter)
+		_log_counter,
+		tonumber(ffi.C.getpid()))
 end
 
 local function pb_encode(s)
@@ -953,23 +976,156 @@ local function url_encode_path(path)
 	return table.concat(out)
 end
 
-local function create_trashinfo(original_path, trash_name)
-	local info_file = path_join(TRASH_INFO_DIR, trash_name .. ".trashinfo")
-	local encoded_path = url_encode_path(original_path)
-	local deletion_date = timestamp_utc("%Y-%m-%dT%H:%M:%S")
-	local body = string.format("[Trash Info]\nPath=%s\nDeletionDate=%s\n", encoded_path, deletion_date)
-	local ok = write_file(info_file, body)
-	return ok ~= nil
+
+-- Platform constants for the atomic-placement syscalls below.
+local IS_OSX = ffi.os == "OSX"
+local O_WRONLY = 1
+local O_CREAT = IS_OSX and 0x200 or 0x40
+local O_EXCL = IS_OSX and 0x800 or 0x80
+local AT_FDCWD = IS_OSX and -2 or -100
+local EEXIST, EXDEV, EINVAL = 17, 18, 22
+local ENOSYS = IS_OSX and 78 or 38
+local ENOTEMPTY = IS_OSX and 66 or 39
+local ENOTSUP = IS_OSX and 45 or 95
+local TRASHINFO_MODE = 384 -- 0600
+local MAX_NAME_ATTEMPTS = 1000
+
+local HAVE_NATIVE_NOREPLACE = pcall(function()
+	return IS_OSX and ffi.C.renamex_np or ffi.C.renameat2
+end)
+
+-- Trash entry name for the Nth reservation attempt. Attempt 0 keeps the plain
+-- basename (what users expect to see); later ones add timestamp, PID and the
+-- attempt number so racing processes diverge immediately instead of retrying
+-- the same candidates in lockstep.
+local function trash_candidate_name(base_name, attempt)
+	if attempt == 0 then
+		return base_name
+	end
+	return string.format("%s_%s_%d_%d", base_name, timestamp_utc("%Y%m%d%H%M%S"),
+		tonumber(ffi.C.getpid()), attempt)
 end
 
-local function get_unique_name(base_name)
-	local name = base_name
-	local counter = 1
-	while path_exists(path_join(TRASH_FILES_DIR, name)) or path_exists(path_join(TRASH_INFO_DIR, name .. ".trashinfo")) do
-		name = string.format("%s_%s_%d", base_name, timestamp_utc("%Y%m%d%H%M%S"), counter)
-		counter = counter + 1
+-- Reserve a Trash name by creating its .trashinfo with O_CREAT|O_EXCL, the
+-- XDG Trash spec's own concurrency protocol (gio and trash-cli do the same).
+-- The kernel arbitrates: exactly one process can create a given info file,
+-- so there is no check-then-act window. Returns true, or false plus errno.
+local function reserve_trashinfo(info_path, body)
+	local fd = ffi.C.open(info_path, bit.bor(O_WRONLY, O_CREAT, O_EXCL), ffi.new("int", TRASHINFO_MODE))
+	if fd < 0 then
+		return false, ffi.errno()
 	end
-	return name
+	local written = ffi.C.write(fd, body, #body)
+	ffi.C.close(fd)
+	if written ~= #body then
+		ffi.C.unlink(info_path)
+		return false, 0
+	end
+	return true
+end
+
+-- Move src to dst ONLY if dst does not exist, atomically. Returns "ok",
+-- "exists" (dst is occupied; nothing was touched), "xdev" (different
+-- filesystems; caller must stage), or "error". Never replaces anything:
+-- native no-replace rename first; without it, linkat+unlink for non-
+-- directories and mkdir+rename-onto-our-own-empty-dir for directories, both
+-- of which also fail rather than overwrite.
+local function rename_noreplace(src, dst)
+	local rc, err
+	if HAVE_NATIVE_NOREPLACE then
+		if IS_OSX then
+			rc = ffi.C.renamex_np(src, dst, 4) -- RENAME_EXCL
+		else
+			rc = ffi.C.renameat2(AT_FDCWD, src, AT_FDCWD, dst, 1) -- RENAME_NOREPLACE
+		end
+		if rc == 0 then return "ok" end
+		err = ffi.errno()
+		if err == EEXIST or err == ENOTEMPTY then return "exists" end
+		if err == EXDEV then return "xdev" end
+		if err ~= EINVAL and err ~= ENOSYS and err ~= ENOTSUP then return "error" end
+	end
+	if is_directory_nonlink(src) then
+		if fs.mkdir(dst) == nil then
+			return path_exists(dst) and "exists" or "error"
+		end
+		-- rename(2) may replace an EMPTY directory; this one is ours. If a
+		-- foreign writer filled it meanwhile, rename fails ENOTEMPTY instead.
+		if ffi.C.rename(src, dst) == 0 then return "ok" end
+		err = ffi.errno()
+		if err ~= ENOTEMPTY and err ~= EEXIST then ffi.C.rmdir(dst) end
+		if err == EXDEV then return "xdev" end
+		return "error"
+	end
+	-- flags=0: link the symlink itself, never its target (macOS link() follows).
+	if ffi.C.linkat(AT_FDCWD, src, AT_FDCWD, dst, 0) ~= 0 then
+		err = ffi.errno()
+		if err == EEXIST then return "exists" end
+		if err == EXDEV then return "xdev" end
+		return "error"
+	end
+	ffi.C.unlink(src)
+	return "ok"
+end
+
+-- Copy an item across filesystems into a fresh mkdtemp directory inside the
+-- Trash. The directory is private to this process, so the (non-atomic) mv
+-- cannot collide with anyone; the final placement is then a same-filesystem
+-- atomic no-replace rename. Returns the staged path and its directory.
+local function stage_into_trash_fs(abs_path)
+	local template = ffi.new("char[?]", #TRASH_BASE_DIR + 32)
+	ffi.copy(template, path_join(TRASH_BASE_DIR, ".rm-safe-staging.XXXXXX"))
+	if ffi.C.mkdtemp(template) == nil then
+		return nil
+	end
+	local staging_dir = ffi.string(template)
+	local cmd = "mv -- " .. shell_quote(abs_path) .. " " .. shell_quote(staging_dir .. "/") .. " >/dev/null 2>&1"
+	if shell_status(cmd) ~= 0 then
+		-- A failed cross-device mv can leave a partial copy here; the
+		-- original is still intact (mv removes it only after a full copy).
+		return nil, staging_dir
+	end
+	return path_join(staging_dir, basename(abs_path)), staging_dir
+end
+
+-- Place abs_path into the Trash under a unique name with no TOCTTOU window:
+-- reserve the name (O_EXCL .trashinfo), then move with no-replace semantics;
+-- on a foreign occupant release the reservation and try the next name.
+-- Returns trash_name, trash_path on success; nil plus a message otherwise.
+local function place_in_trash(abs_path)
+	local base_name = basename(abs_path)
+	local body = string.format("[Trash Info]\nPath=%s\nDeletionDate=%s\n",
+		url_encode_path(abs_path), timestamp_utc("%Y-%m-%dT%H:%M:%S"))
+	local src, staging_dir = abs_path, nil
+	for attempt = 0, MAX_NAME_ATTEMPTS - 1 do
+		local name = trash_candidate_name(base_name, attempt)
+		local info_path = path_join(TRASH_INFO_DIR, name .. ".trashinfo")
+		local reserved, err = reserve_trashinfo(info_path, body)
+		if reserved then
+			local dst = path_join(TRASH_FILES_DIR, name)
+			local result = rename_noreplace(src, dst)
+			if result == "xdev" and not staging_dir then
+				local staged
+				staged, staging_dir = stage_into_trash_fs(abs_path)
+				if staged then
+					src = staged
+					result = rename_noreplace(src, dst)
+				end
+			end
+			if result == "ok" then
+				if staging_dir then ffi.C.rmdir(staging_dir) end
+				return name, dst
+			end
+			ffi.C.unlink(info_path) -- release the reservation
+			if result ~= "exists" then break end
+		elseif err ~= EEXIST then
+			break
+		end
+	end
+	if staging_dir and src ~= abs_path then
+		return nil, "item is preserved in " .. staging_dir
+	end
+	if staging_dir then ffi.C.rmdir(staging_dir) end
+	return nil
 end
 
 local function prompt_yes_no(prompt)
@@ -1032,18 +1188,15 @@ local function trash_item(item)
 		end
 	end
 
-	local base_name = basename(abs_path)
-	local trash_name = get_unique_name(base_name)
-	local trash_path = path_join(TRASH_FILES_DIR, trash_name)
-
-	if move_path(abs_path, trash_path) then
-		create_trashinfo(abs_path, trash_name)
+	local trash_name, trash_path = place_in_trash(abs_path)
+	if trash_name then
 		log_action("TRASH_MANUAL", abs_path, trash_path)
 		verbose("Moved '" .. item .. "' to trash as '" .. trash_name .. "'")
 		return true
 	end
 
-	stderr_write("rm-safe: Error: Failed to move '" .. item .. "' to trash\n")
+	local why = trash_path and (" (" .. trash_path .. ")") or ""
+	stderr_write("rm-safe: Error: Failed to move '" .. item .. "' to trash" .. why .. "\n")
 	log_action("FAIL_MOVE", abs_path)
 	return false
 end

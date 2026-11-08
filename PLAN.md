@@ -2,6 +2,14 @@
 
 ## Active
 
+- [x] Make concurrent trashing collision-free (inbox 2026-11-08, dotconfig): a
+      stress test reproduced silent clobbering (31/32 payloads) and cross-device
+      failures; replaced probe-then-move with O_EXCL .trashinfo reservation +
+      no-replace rename + private cross-device staging; PID added to log
+      fragment names. Mutation-checked. (2026-11-08 EST)
+- [ ] Apply the same no-replace move to `--undo` restore (it still checks the
+      original path, then moves, and could clobber a concurrently created file).
+
 Goal: protect ordinary `rmdir` invocations with an installable shadow that moves
 empty directories to Trash, while retaining `rmdir`'s non-recursive safety
 contract. Done when the package installs the shadow, documentation tells users

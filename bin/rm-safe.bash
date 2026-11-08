@@ -52,6 +52,31 @@ GMV=$(_resolve_tool gmv mv)
 GMKDIR=$(_resolve_tool gmkdir mkdir)
 GFIND=$(_resolve_tool gfind find)
 
+# Resolve a REAL removal tool, never a safety shadow. A bare `rm`/`rmdir` can
+# resolve to this project's own shadows (rmdir -> rm-safe -r -> rmdir ...:
+# unbounded recursion), and `command -p` is no answer: its POSIX default PATH
+# is /bin:/usr/bin, which holds no coreutils inside the Nix sandbox or on
+# stock NixOS-like layouts. Every shadow is a script (Nix wrappers included)
+# while real coreutils are binaries, so take the first non-script candidate.
+_resolve_real_tool() { # $@ = candidate names in preference order
+	local name cand magic
+	for name in "$@"; do
+		while IFS= read -r cand; do
+			[[ -n $cand ]] || continue
+			magic=""
+			IFS= read -r -n 2 magic <"$cand" 2>/dev/null
+			[[ $magic == '#!' ]] && continue
+			printf '%s' "$cand"
+			return 0
+		done < <(type -aP "$name" 2>/dev/null)
+	done
+	return 1
+}
+REAL_RM_TOOL=$(_resolve_real_tool grm rm) || REAL_RM_TOOL=""
+REAL_RMDIR_TOOL=$(_resolve_real_tool grmdir rmdir) || REAL_RMDIR_TOOL=""
+_real_unlink() { [[ -n $REAL_RM_TOOL ]] && "$REAL_RM_TOOL" -f -- "$1"; }
+_real_rmdir() { [[ -n $REAL_RMDIR_TOOL ]] && "$REAL_RMDIR_TOOL" -- "$1" 2>/dev/null; }
+
 # mktemp -d: GNU accepts --tmpdir; BSD needs a full template path. Probe once.
 if "$GMKTEMP" --version >/dev/null 2>&1; then
 	_mktemp_dir() { "$GMKTEMP" -d --tmpdir "${1:-tmp}.XXXXXX"; }   # GNU
@@ -237,7 +262,10 @@ _epoch_ns_str() {
 		fallback) ns=$(printf '%s000000000' "$(date +%s)") ;;
 	esac
 	((_LOG_COUNTER++))
-	printf '%s-%04d' "$ns" "$_LOG_COUNTER"
+	# PID makes names unique ACROSS processes too: two concurrent rm-safe runs
+	# can share a nanosecond (or a whole second, in the fallback above), and
+	# a shared fragment name would make one overwrite the other's undo record.
+	printf '%s-%04d-%d' "$ns" "$_LOG_COUNTER" "$$"
 }
 
 _pb_encode() {
@@ -408,7 +436,7 @@ restore_trash_entry() {
 
 	if "$GMV" -- "$trash_path" "$original_path"; then
 		local info_file="$TRASH_INFO_DIR/${trash_path##*/}.trashinfo"
-		[[ -e $info_file ]] && command -p rm -f -- "$info_file"
+		[[ -e $info_file ]] && _real_unlink "$info_file"
 		log_action "TRASH_RESTORE" "$trash_path" "$original_path"
 		echo "Path $trash_path restored to $original_path successfully." >&2
 		return 0
@@ -682,21 +710,80 @@ url_encode_path() {
 	printf '%s' "$encoded"
 }
 
-# Create trashinfo file
-create_trashinfo() {
-	local original_path=$1 trash_name=$2
-	local info_file="$TRASH_INFO_DIR/$trash_name.trashinfo"
-	local encoded_path=""
-	local deletion_date=""
-	url_encode_path_into encoded_path "$original_path"
-	timestamp_utc_into deletion_date '%Y-%m-%dT%H:%M:%S'
-
-	printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' \
-		"$encoded_path" \
-		"$deletion_date" > "$info_file"
+# Reserve a Trash name by creating its .trashinfo exclusively. Bash's
+# noclobber opens a new file with O_CREAT|O_EXCL, so exactly one process can
+# win a given name -- the XDG Trash spec's own concurrency protocol (gio and
+# trash-cli do the same). No check-then-act window. $1 = info file, $2 = body.
+_reserve_trashinfo() {
+	( set -C; printf '%s' "$2" >"$1" ) 2>/dev/null
 }
 
-# Get unique name in trash
+# Detect once whether mv offers an atomic no-replace move. GNU mv -n issues
+# renameat2(RENAME_NOREPLACE); -T stops it descending into a directory that
+# occupies the destination. BSD mv -n is check-then-rename, so there the
+# .trashinfo reservation is the only arbiter (sufficient against every
+# spec-following trasher; Finder never writes into the Trash/files subdir).
+if "$GMV" --version 2>/dev/null | grep -q GNU; then
+	_mv_noreplace() { "$GMV" -n -T -- "$1" "$2" 2>/dev/null; }
+else
+	_mv_noreplace() { "$GMV" -n -- "$1" "$2" 2>/dev/null; }
+fi
+
+# Trash entry name for the Nth reservation attempt: the plain basename first,
+# then timestamp+PID+attempt so racing processes diverge immediately.
+_trash_candidate_name_into() { # $1 = out var, $2 = base name, $3 = attempt
+	local __cand_ts
+	if [[ $3 -eq 0 ]]; then
+		printf -v "$1" '%s' "$2"
+		return
+	fi
+	timestamp_utc_into __cand_ts '%Y%m%d%H%M%S'
+	printf -v "$1" '%s_%s_%d_%d' "$2" "$__cand_ts" "$$" "$3"
+}
+
+# Place an item in the Trash with no TOCTTOU window. First move it into a
+# fresh mktemp directory inside the Trash (private to this process, so the
+# possibly cross-device, non-atomic mv cannot collide), then reserve a name
+# (exclusive .trashinfo) and move it into place without replacing anything.
+# The outcome is verified from the filesystem, not mv's exit status (GNU mv -n
+# exits 0 when it declines). Sets $1 to the trash name; returns non-zero and
+# sets $2 to a diagnostic on failure.
+# Cleanup goes through _real_rmdir/_real_unlink, never bare rmdir/rm: those
+# can resolve to this project's shadows and recurse without bound.
+place_in_trash_into() { # $1 = out name var, $2 = out diagnostic var, $3 = abs path
+	local abs_path=$3 base_name=${3##*/} staging staged attempt name info_file body
+	local encoded_path="" deletion_date=""
+	url_encode_path_into encoded_path "$abs_path"
+	timestamp_utc_into deletion_date '%Y-%m-%dT%H:%M:%S'
+	printf -v body '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$encoded_path" "$deletion_date"
+
+	staging=$("$GMKTEMP" -d "$TRASH_BASE_DIR/.rm-safe-staging.XXXXXX" 2>/dev/null) || return 1
+	if ! "$GMV" -- "$abs_path" "$staging/" 2>/dev/null; then
+		_real_rmdir "$staging" || printf -v "$2" '%s' "partial copy left in $staging"
+		return 1
+	fi
+	staged="$staging/$base_name"
+	for ((attempt = 0; attempt < 1000; attempt++)); do
+		_trash_candidate_name_into name "$base_name" "$attempt"
+		info_file="$TRASH_INFO_DIR/$name.trashinfo"
+		if ! _reserve_trashinfo "$info_file" "$body"; then
+			[[ -e $info_file ]] && continue
+			break
+		fi
+		_mv_noreplace "$staged" "$TRASH_FILES_DIR/$name"
+		if [[ ! -e $staged && ! -L $staged ]]; then
+			_real_rmdir "$staging"
+			printf -v "$1" '%s' "$name"
+			return 0
+		fi
+		_real_unlink "$info_file" # release the reservation; name is occupied
+	done
+	printf -v "$2" '%s' "item is preserved in $staging"
+	return 1
+}
+
+# Get unique name in trash (self-test helper only; never used for placement,
+# because probing then moving is exactly the race place_in_trash_into avoids)
 get_unique_name_into() {
 	local __out_var=$1
 	local base_name=$2
@@ -804,18 +891,14 @@ trash_item() {
 	fi
 
 	# Manual fallback
-	local base_name=${abs_path##*/}
-	local trash_name=""
-	get_unique_name_into trash_name "$base_name"
-	local trash_path="$TRASH_FILES_DIR/$trash_name"
-
-	if "$GMV" -- "$abs_path" "$trash_path"; then
-		create_trashinfo "$abs_path" "$trash_name"
+	local trash_name="" place_err=""
+	if place_in_trash_into trash_name place_err "$abs_path"; then
+		local trash_path="$TRASH_FILES_DIR/$trash_name"
 		log_action "TRASH_MANUAL" "$abs_path" "$trash_path"
 		verbose "Moved '$item' to trash as '$trash_name'"
 		return 0
 	else
-		echo "rm-safe: Error: Failed to move '$item' to trash" >&2
+		echo "rm-safe: Error: Failed to move '$item' to trash${place_err:+ ($place_err)}" >&2
 		log_action "FAIL_MOVE" "$abs_path"
 		return 1
 	fi
@@ -898,7 +981,7 @@ show_help() {
 		      Ensure rm-safe (or a wrapper) is built into /run/wrappers/bin.
 
 		  Implementation detail:
-		    rm-safe calls the system rm via 'command -p rm' to avoid recursion when
+		    rm-safe resolves a real (non-script) rm/rmdir to avoid recursion when
 		    installed as an override.
 
 		Features:
