@@ -8,7 +8,8 @@
 	- CLI parser: supports rm-safe flags/options (`-f/-i/-r/-v`, `--undo`, `--undo-picker`, `--help`, `--about`, `--test`).
 	- init/get_trash_base/detect_capabilities: resolves trash paths, initializes dirs/log, and detects optional helpers (`gum`, `fzf`, `gio`, `trash-put`, `lsattr`).
 	- trash_item: moves files/directories to trash with protection checks, optional picker utilities, and action logging.
-	- place_in_trash/reserve_trashinfo/rename_noreplace/stage_into_trash_fs: TOCTTOU-free placement -- O_EXCL .trashinfo name reservation, atomic no-replace rename (renameat2/renamex_np, linkat or mkdir fallbacks), private staging dir for cross-device moves. Mirrored in rm-safe.bash as place_in_trash_into/_reserve_trashinfo/_mv_noreplace.
+	- place_in_trash/reserve_trashinfo/rename_noreplace/stage_into_trash_fs: TOCTTOU-free placement -- O_EXCL .trashinfo name reservation, atomic no-replace rename (renameat2/renamex_np, linkat or mkdir fallbacks), private staging dir for cross-device moves. Mirrored in rm-safe.bash as place_in_trash_into/_reserve_trashinfo/_mv_noreplace (gnu: mv -n -T; posix: ln/ln -s/dir mv).
+	- write_exclusive/make_private_dir/resolve_real_tool/copy_restore_across_devices: O_EXCL file creation, mkdtemp dirs, non-script tool resolution (shadow- and function-proof), and cross-device --undo via copy-stage + no-replace rename.
 	- undo_with_offset/undo_picker/restore_trash_entry: restores `TRASH_MANUAL` entries from log history.
 	- resolve_path/is_protected/is_immutable/url_encode_path: path safety, immutability checks, and XDG trash metadata generation.
 	- run_tests: integrated runner that executes external test suites.

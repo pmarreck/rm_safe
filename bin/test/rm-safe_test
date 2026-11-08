@@ -425,7 +425,7 @@ concurrency_round() {
 		pids=()
 		for ((i = 1; i <= n; i++)); do
 			# Busy-wait on a gate file (no sleeps) so all workers start together.
-			env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$PATH_BASE" bash -c '
+			env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$ACTIVE_PATH" "${HOSTILE_FUNCS[@]}" bash -c '
 				until [[ -e $1 ]]; do :; done
 				exec rm-safe -rf "$2/same.txt" "$2/same dir"
 			' _ "$gate" "$src_root/w/$i" >"$src_root/out.$i" 2>&1 &
@@ -499,23 +499,159 @@ else
 	((fails++))
 fi
 
+# --undo onto an occupied target must refuse, never replace.
+# The restore is a single no-replace rename (no exists-check first), so this
+# deterministic case and the check-then-move race are one and the same code
+# path: whatever occupies the target, created early or mid-restore, survives,
+# and the item stays in the Trash with its .trashinfo.
+# $1 = label, $2 = parent dir, $3 = file|dir
+undo_occupied_case() {
+	local label=$1 parent=$2 kind=$3 target entry ok=true detail=""
+	local out err rc trash_rc
+	target="$parent/undo-occupied-$kind"
+	reset_trash
+	"$REAL_RM" -rf "$target"
+	if [[ $kind == dir ]]; then mkdir -p "$target"; echo old >"$target/inner"; else echo old >"$target"; fi
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$ACTIVE_PATH" "${HOSTILE_FUNCS[@]}" rm-safe -r "$target"
+	trash_rc=$rc
+	# The recreated occupant: an EMPTY dir is the sharp case, because rename(2)
+	# silently replaces an empty directory.
+	if [[ $kind == dir ]]; then mkdir "$target"; else echo new >"$target"; fi
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$ACTIVE_PATH" "${HOSTILE_FUNCS[@]}" rm-safe --undo
+	entry=$(find "$TRASH_FILES" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)
+	if [[ $trash_rc -ne 0 ]]; then
+		ok=false; detail="trash step failed rc=$trash_rc"
+	elif [[ $rc -eq 0 ]]; then
+		ok=false; detail="undo exited 0 onto an occupied target"
+	elif [[ $kind == dir && ( ! -d $target || -n $(ls -A "$target") ) ]]; then
+		ok=false; detail="occupant dir was replaced or filled"
+	elif [[ $kind == file && $(cat "$target" 2>/dev/null) != new ]]; then
+		ok=false; detail="occupant file was overwritten"
+	elif [[ -z $entry ]]; then
+		ok=false; detail="trashed item vanished from the Trash"
+	elif [[ $kind == dir && $(cat "$entry/inner" 2>/dev/null) != old ]] || [[ $kind == file && $(cat "$entry" 2>/dev/null) != old ]]; then
+		ok=false; detail="trashed payload damaged"
+	elif [[ ! -f "$TRASH_INFO/$(basename "$entry").trashinfo" ]]; then
+		ok=false; detail="trashinfo removed although restore failed"
+	elif read_all_logs | awk -F'\t' '$3 ~ /TRASH_RESTORE$/' | grep -q .; then
+		ok=false; detail="TRASH_RESTORE logged for a refused restore"
+	elif ! printf '%s' "$err" | grep -qF "Restore target already exists"; then
+		ok=false; detail="missing refusal message: $err"
+	elif [[ -n $(find "$parent" -maxdepth 1 -name '.rm-safe-*' 2>/dev/null) ]]; then
+		ok=false; detail="left staging directories beside the target"
+	fi
+	"$REAL_RM" -rf "$target"
+	((tests++))
+	if [[ $ok == true ]]; then
+		echo "OK undo refuses an occupied $kind target ($label)"
+	else
+		echo "FAIL undo onto occupied $kind target ($label): $detail" >&2
+		((fails++))
+	fi
+}
+
+# Successful --undo leaves nothing behind: payload restored, Trash entry and
+# .trashinfo gone, TRASH_RESTORE logged, no staging debris.
+# $1 = label, $2 = parent dir, $3 = file|dir
+undo_restores_case() {
+	local label=$1 parent=$2 kind=$3 target ok=true detail="" out err rc
+	target="$parent/undo-restores-$kind"
+	reset_trash
+	"$REAL_RM" -rf "$target"
+	if [[ $kind == dir ]]; then mkdir -p "$target"; echo old >"$target/inner"; else echo old >"$target"; fi
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$ACTIVE_PATH" "${HOSTILE_FUNCS[@]}" rm-safe -r "$target"
+	capture env HOME="$HOME_DIR" XDG_DATA_HOME="$XDG_DIR" PATH="$ACTIVE_PATH" "${HOSTILE_FUNCS[@]}" rm-safe --undo
+	if [[ $rc -ne 0 ]]; then
+		ok=false; detail="undo rc=$rc: $err"
+	elif [[ $kind == dir && $(cat "$target/inner" 2>/dev/null) != old ]] || [[ $kind == file && $(cat "$target" 2>/dev/null) != old ]]; then
+		ok=false; detail="payload not restored"
+	elif [[ -n $(find "$TRASH_FILES" "$TRASH_INFO" -mindepth 1 2>/dev/null) ]]; then
+		ok=false; detail="Trash entry or trashinfo left behind"
+	elif ! read_all_logs | awk -F'\t' '$3 ~ /TRASH_RESTORE$/' | grep -q .; then
+		ok=false; detail="TRASH_RESTORE not logged"
+	elif [[ -n $(find "$parent" "$TRASH_BASE" -maxdepth 1 -name '.rm-safe-*' 2>/dev/null) ]]; then
+		ok=false; detail="left staging directories"
+	fi
+	"$REAL_RM" -rf "$target"
+	((tests++))
+	if [[ $ok == true ]]; then
+		echo "OK undo restores a $kind ($label)"
+	else
+		echo "FAIL undo restore of $kind ($label): $detail" >&2
+		((fails++))
+	fi
+}
+
 CONC_WORKERS=16
 CONC_ROUNDS=3
 CONC_SAME_FS="$TEST_DIR/conc"
 mkdir -p "$CONC_SAME_FS"
-concurrency_round "same filesystem" "$CONC_SAME_FS"
 
-# Cross-device variant: sources on a different mount than the Trash, so the
-# move cannot be a single rename(2). /dev/shm is a separate tmpfs on Linux.
+# Cross-device parent: sources on a different mount than the Trash, so a move
+# cannot be a single rename(2). /dev/shm is a separate tmpfs on Linux.
 CONC_XDEV=""
 if [[ -d /dev/shm && -w /dev/shm ]]; then
 	CONC_XDEV=$(mktemp -d /dev/shm/rm-safe-conc.XXXXXX 2>/dev/null || true)
 fi
-if [[ -n $CONC_XDEV ]] && [[ $(stat -c %d "$CONC_XDEV" 2>/dev/null) != "$(stat -c %d "$TEST_DIR" 2>/dev/null)" ]]; then
-	concurrency_round "cross-device" "$CONC_XDEV"
-else
-	skip_test "concurrent cross-device trashing" "no writable mount distinct from \$TMPDIR"
+if [[ -n $CONC_XDEV ]] && [[ $(stat -c %d "$CONC_XDEV" 2>/dev/null) == "$(stat -c %d "$TEST_DIR" 2>/dev/null)" ]]; then
+	"$REAL_RM" -rf "$CONC_XDEV"; CONC_XDEV=""
 fi
+
+# Every placement/restore invariant, under the current $ACTIVE_PATH.
+atomicity_suite() { # $1 = flavor label
+	local flavor=$1 kind
+	concurrency_round "same filesystem, $flavor" "$CONC_SAME_FS"
+	for kind in file dir; do
+		undo_occupied_case "same filesystem, $flavor" "$CONC_SAME_FS" "$kind"
+		undo_restores_case "same filesystem, $flavor" "$CONC_SAME_FS" "$kind"
+	done
+	if [[ -n $CONC_XDEV ]]; then
+		concurrency_round "cross-device, $flavor" "$CONC_XDEV"
+		for kind in file dir; do
+			undo_occupied_case "cross-device, $flavor" "$CONC_XDEV" "$kind"
+			undo_restores_case "cross-device, $flavor" "$CONC_XDEV" "$kind"
+		done
+	else
+		skip_test "cross-device atomicity ($flavor)" "no writable mount distinct from \$TMPDIR"
+	fi
+}
+
+# Exported shell functions shadowing the tools rm-safe shells out to. /bin/sh
+# is often bash, which imports these, so a bare `cp`/`mv`/`ln` would run them.
+# rm-safe must invoke real executables by path and never notice.
+HOSTILE_FUNCS=()
+for fn in cp mv ln rm rmdir readlink; do
+	HOSTILE_FUNCS+=("BASH_FUNC_${fn}%%=() { return 97; }")
+done
+
+ACTIVE_PATH=$PATH_BASE
+atomicity_suite "GNU mv"
+
+# Same invariants with a BSD-like mv: no --version, -n, -T or --update. This
+# forces the bash impl off GNU mv's RENAME_NOREPLACE onto its posix mode
+# (ln / ln -s / plain directory mv), and proves the luajit impl never relies
+# on GNU mv semantics either.
+BSD_MV_DIR="$TEST_DIR/bsd-mv"
+mkdir -p "$BSD_MV_DIR"
+GNU_MV=$(PATH="$PATH_BASE" type -P mv)
+for mv_name in mv gmv; do
+	cat >"$BSD_MV_DIR/$mv_name" <<BSDMV
+#!/bin/sh
+for a in "\$@"; do
+	case \$a in
+		--) break ;;
+		--version|-n|-T|--no-clobber|--update*|--no-target-directory) echo "mv: illegal option \$a" >&2; exit 64 ;;
+	esac
+done
+exec "$GNU_MV" "\$@"
+BSDMV
+	chmod +x "$BSD_MV_DIR/$mv_name"
+done
+ACTIVE_PATH="$BSD_MV_DIR:$PATH_BASE"
+atomicity_suite "BSD mv"
+
+ACTIVE_PATH=$PATH_BASE
+
 [[ -n $CONC_XDEV ]] && "$REAL_RM" -rf "$CONC_XDEV"
 echo "=== Test Summary ==="
 echo "Passed: $((tests - fails - skips))"

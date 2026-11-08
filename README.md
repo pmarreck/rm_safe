@@ -169,7 +169,9 @@ Claude Code / AI agent integration
 
 Concurrency
 - Any number of `rm-safe` processes may trash same-named items at once. A Trash name is reserved by creating its `.trashinfo` with `O_CREAT|O_EXCL` (the XDG Trash spec's protocol, shared with gio and trash-cli), and the item moves in with a no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS), so an existing Trash entry is never overwritten. Cross-device items are first moved into a private staging directory inside the Trash, then renamed into place atomically.
-- The bash fallback uses noclobber (`O_EXCL`) for the reservation and GNU `mv -n -T` (`RENAME_NOREPLACE`) for placement. With BSD `mv` the reservation alone arbitrates, which covers every spec-following trasher.
+- `--undo` uses the same no-replace rename with no prior existence check, so a file or directory that appears at the original path (before or during the restore) is never replaced; the item stays in the Trash. Cross-device restores copy into a private staging directory beside the target, place the copy atomically, then delete the Trash original.
+- Log fragments and `.trashinfo` files are created exclusively (`O_EXCL`), and tools are invoked by resolved path, so exported shell functions (`BASH_FUNC_cp%%` etc.) cannot hijack them.
+- The bash fallback uses noclobber (`O_EXCL`) for reservations and GNU `mv -n -T` (`RENAME_NOREPLACE`) for moves. Without GNU `mv` it uses `ln`/`ln -s` (fail with `EEXIST`) for files and symlinks and plain `mv` for directories, which cannot destroy data but can nest an item inside an empty directory that appears in the instant before the rename. The luajit implementation has no such gap.
 
 Cautions
 - Log-rotate/cleanup scripts that expect permanent deletion will move files to trash when the shim is first in PATH; they should call `/bin/rm` explicitly if deletion is intended.

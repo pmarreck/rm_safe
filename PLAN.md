@@ -7,8 +7,10 @@
       failures; replaced probe-then-move with O_EXCL .trashinfo reservation +
       no-replace rename + private cross-device staging; PID added to log
       fragment names. Mutation-checked. (2026-11-08 EST)
-- [ ] Apply the same no-replace move to `--undo` restore (it still checks the
-      original path, then moves, and could clobber a concurrently created file).
+- [x] `--undo` restore uses the no-replace move with no pre-check (cross-device:
+      copy-stage beside target); exclusive log fragments; private picker temp
+      dir; tools invoked by path (immune to exported shell functions); bash
+      posix mode (ln/ln -s) replaces BSD `mv -n`. Mutation-checked. (2026-11-08 EST)
 
 Goal: protect ordinary `rmdir` invocations with an installable shadow that moves
 empty directories to Trash, while retaining `rmdir`'s non-recursive safety

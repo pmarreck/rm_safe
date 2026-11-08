@@ -303,6 +303,106 @@ local function path_join(a, b)
 	return a .. "/" .. b
 end
 
+-- Platform constants for the atomic-placement syscalls below.
+local IS_OSX = ffi.os == "OSX"
+local O_WRONLY = 1
+local O_CREAT = IS_OSX and 0x200 or 0x40
+local O_EXCL = IS_OSX and 0x800 or 0x80
+local AT_FDCWD = IS_OSX and -2 or -100
+local EEXIST, EXDEV, EINVAL = 17, 18, 22
+local ENOSYS = IS_OSX and 78 or 38
+local ENOTEMPTY = IS_OSX and 66 or 39
+local ENOTSUP = IS_OSX and 45 or 95
+
+local HAVE_NATIVE_NOREPLACE = pcall(function()
+	return IS_OSX and ffi.C.renamex_np or ffi.C.renameat2
+end)
+
+local TRASHINFO_MODE = 384 -- 0600
+local FRAGMENT_MODE = 438 -- 0666, umask applies (matches io.open)
+local MAX_NAME_ATTEMPTS = 1000
+
+-- Create path and write data ONLY if path does not exist yet: open(2) with
+-- O_CREAT|O_EXCL, so the kernel guarantees no existing file is truncated or
+-- replaced, even by a racing process. Returns true, or false plus errno.
+local function write_exclusive(path, data, mode)
+	local fd = ffi.C.open(path, bit.bor(O_WRONLY, O_CREAT, O_EXCL), ffi.new("int", mode))
+	if fd < 0 then
+		return false, ffi.errno()
+	end
+	local written = ffi.C.write(fd, data, #data)
+	ffi.C.close(fd)
+	if written ~= #data then
+		ffi.C.unlink(path)
+		return false, 0
+	end
+	return true
+end
+
+-- Move src to dst ONLY if dst does not exist, atomically. Returns "ok",
+-- "exists" (dst is occupied; nothing was touched), "xdev" (different
+-- filesystems; caller must stage), or "error". Never replaces anything:
+-- native no-replace rename first; without it, linkat+unlink for non-
+-- directories and mkdir+rename-onto-our-own-empty-dir for directories, both
+-- of which also fail rather than overwrite.
+local function rename_noreplace(src, dst)
+	local rc, err
+	if HAVE_NATIVE_NOREPLACE then
+		if IS_OSX then
+			rc = ffi.C.renamex_np(src, dst, 4) -- RENAME_EXCL
+		else
+			rc = ffi.C.renameat2(AT_FDCWD, src, AT_FDCWD, dst, 1) -- RENAME_NOREPLACE
+		end
+		if rc == 0 then return "ok" end
+		err = ffi.errno()
+		if err == EEXIST or err == ENOTEMPTY then return "exists" end
+		if err == EXDEV then return "xdev" end
+		if err ~= EINVAL and err ~= ENOSYS and err ~= ENOTSUP then return "error" end
+	end
+	if is_directory_nonlink(src) then
+		if fs.mkdir(dst) == nil then
+			return path_exists(dst) and "exists" or "error"
+		end
+		-- rename(2) may replace an EMPTY directory; this one is ours. If a
+		-- foreign writer filled it meanwhile, rename fails ENOTEMPTY instead.
+		if ffi.C.rename(src, dst) == 0 then return "ok" end
+		err = ffi.errno()
+		if err ~= ENOTEMPTY and err ~= EEXIST then ffi.C.rmdir(dst) end
+		if err == EXDEV then return "xdev" end
+		return "error"
+	end
+	-- flags=0: link the symlink itself, never its target (macOS link() follows).
+	if ffi.C.linkat(AT_FDCWD, src, AT_FDCWD, dst, 0) ~= 0 then
+		err = ffi.errno()
+		if err == EEXIST then return "exists" end
+		if err == EXDEV then return "xdev" end
+		return "error"
+	end
+	ffi.C.unlink(src)
+	return "ok"
+end
+
+-- First executable named `name` on PATH that is NOT a script. All of this
+-- project's shadows (rm, rmdir, find...) are scripts, Nix wrappers included,
+-- while real coreutils are binaries; so this can never select a shadow and
+-- recurse back into rm-safe. Shelling out to a bare `rm -rf` would.
+local function resolve_real_tool(name)
+	for dir in (os.getenv("PATH") or ""):gmatch("[^:]+") do
+		local cand = path_join(dir, name)
+		if ffi.C.access(cand, 1) == 0 and not fs.is_dir(cand) then
+			local fh = io.open(cand, "rb")
+			if fh then
+				local magic = fh:read(2)
+				fh:close()
+				if magic ~= "#!" then
+					return cand
+				end
+			end
+		end
+	end
+	return nil
+end
+
 local function mkdir_p(path)
 	if path == "" or path == "." then
 		return true
@@ -637,11 +737,9 @@ local function log_action(action, path, trash_path, details)
 	-- path stays intact.
 	local frag_path = fragment_path_for(path)
 	if frag_path == nil then return end
-	local f = io.open(frag_path, "wb")
-	if f then
-		f:write(line)
-		f:close()
-	end
+	-- Exclusive create: a fragment is never truncated or replaced, even if a
+	-- name ever repeated (names already carry epoch-ns + counter + PID).
+	write_exclusive(frag_path, line, FRAGMENT_MODE)
 end
 
 local function is_interactive_terminal()
@@ -732,13 +830,62 @@ local function get_trash_manual_entry(offset, action_name)
 	return nil
 end
 
-local function move_path(src, dst)
-	local ok = os.rename(src, dst)
-	if ok then
-		return true
+-- mkdtemp(3) under parent: an atomically created, uniquely named directory
+-- only this process knows about. Returns its path or nil.
+local function make_private_dir(parent, prefix)
+	local template = path_join(parent, prefix .. ".XXXXXX")
+	local buf = ffi.new("char[?]", #template + 1)
+	ffi.copy(buf, template)
+	if ffi.C.mkdtemp(buf) == nil then
+		return nil
 	end
-	local cmd = "mv -- " .. shell_quote(src) .. " " .. shell_quote(dst) .. " >/dev/null 2>&1"
-	return shell_status(cmd) == 0
+	return ffi.string(buf)
+end
+
+-- Cross-device restore without a check-then-act window and without ever
+-- moving data back: COPY the Trash entry into a private staging dir on the
+-- target's filesystem, place the copy with an atomic no-replace rename, and
+-- only then delete the Trash original. Any failure deletes just the staging
+-- copy; the Trash entry stays intact. Returns rename_noreplace-style status.
+local function copy_restore_across_devices(trash_path, original_path)
+	-- Fast refusal before a possibly large copy. Not a safety check: the
+	-- no-replace rename below is the authority if something appears later.
+	if path_exists(original_path) then
+		return "exists"
+	end
+	local real_rm = resolve_real_tool("rm")
+	if not real_rm then
+		return "error", "no non-shadow rm to remove the Trash copy after restoring"
+	end
+	local staging = make_private_dir(dirname(original_path), ".rm-safe-restore")
+	if not staging then
+		return "error", "cannot create a staging directory beside the target"
+	end
+	local function discard_staging()
+		shell_status(shell_quote(real_rm) .. " -rf -- " .. shell_quote(staging) .. " >/dev/null 2>&1")
+	end
+	local cp = resolve_real_tool("cp")
+	if not cp then
+		discard_staging()
+		return "error", "no cp executable on PATH"
+	end
+	-- Absolute path: a bare `cp` would obey exported shell functions
+	-- (BASH_FUNC_cp%%), since /bin/sh is often bash.
+	local copy_cmd = shell_quote(cp) .. " -a -- " .. shell_quote(trash_path) .. " " .. shell_quote(staging .. "/") .. " >/dev/null 2>&1"
+	if shell_status(copy_cmd) ~= 0 then
+		discard_staging()
+		return "error", "copy across filesystems failed"
+	end
+	local result = rename_noreplace(path_join(staging, basename(trash_path)), original_path)
+	if result ~= "ok" then
+		discard_staging()
+		return result
+	end
+	ffi.C.rmdir(staging)
+	if shell_status(shell_quote(real_rm) .. " -rf -- " .. shell_quote(trash_path) .. " >/dev/null 2>&1") ~= 0 then
+		return "ok", "restored, but the Trash copy could not be removed: " .. trash_path
+	end
+	return "ok"
 end
 
 local function restore_trash_entry(trash_path, original_path)
@@ -750,18 +897,27 @@ local function restore_trash_entry(trash_path, original_path)
 		stderr_write("rm-safe: Error: Trash path not found: " .. trash_path .. "\n")
 		return false
 	end
-	if path_exists(original_path) then
-		stderr_write("rm-safe: Error: Restore target already exists: " .. original_path .. "\n")
-		return false
-	end
-
+	-- No "does the target exist?" pre-check: that would be check-then-act.
+	-- The no-replace rename IS the check, so a target that already exists and
+	-- one created mid-restore are refused by the same atomic operation.
 	local original_dir = dirname(original_path)
 	if not mkdir_p(original_dir) then
 		stderr_write("rm-safe: Error: Cannot create directory: " .. original_dir .. "\n")
 		return false
 	end
 
-	if move_path(trash_path, original_path) then
+	local result, note = rename_noreplace(trash_path, original_path)
+	if result == "xdev" then
+		result, note = copy_restore_across_devices(trash_path, original_path)
+	end
+	if result == "exists" then
+		stderr_write("rm-safe: Error: Restore target already exists: " .. original_path .. "\n")
+		return false
+	end
+	if result == "ok" then
+		if note then
+			stderr_write("rm-safe: Warning: " .. note .. "\n")
+		end
 		local info_file = path_join(TRASH_INFO_DIR, basename(trash_path) .. ".trashinfo")
 		os.remove(info_file)
 		log_action("TRASH_RESTORE", trash_path, original_path)
@@ -769,7 +925,8 @@ local function restore_trash_entry(trash_path, original_path)
 		return true
 	end
 
-	stderr_write("rm-safe: Error: Failed to restore '" .. trash_path .. "' to '" .. original_path .. "'\n")
+	stderr_write("rm-safe: Error: Failed to restore '" .. trash_path .. "' to '" .. original_path .. "'"
+		.. (note and (" (" .. note .. ")") or "") .. "\n")
 	return false
 end
 
@@ -794,10 +951,16 @@ local function strip_ansi(s)
 end
 
 local function run_picker(picker, menu_lines)
-	local tmpdir = os.getenv("TMPDIR") or "/tmp"
-	local base = string.format("%s/rm-safe-picker.%d.%d", tmpdir, os.time(), math.random(1000000))
-	local in_file = base .. ".in"
-	local out_file = base .. ".out"
+	-- Private mkdtemp dir: the old time+math.random name was predictable
+	-- (math.random is seeded with os.time(), so runs started in the same second
+	-- produce the same name), so concurrent pickers
+	-- collided and another local user could pre-plant the path.
+	local pick_dir = make_private_dir(os.getenv("TMPDIR") or "/tmp", "rm-safe-pick")
+	if not pick_dir then
+		return nil
+	end
+	local in_file = path_join(pick_dir, "in")
+	local out_file = path_join(pick_dir, "out")
 	write_file(in_file, table.concat(menu_lines, "\n") .. "\n")
 
 	local cmd
@@ -811,6 +974,7 @@ local function run_picker(picker, menu_lines)
 	local out = read_file(out_file) or ""
 	os.remove(in_file)
 	os.remove(out_file)
+	ffi.C.rmdir(pick_dir)
 	if rc ~= 0 then
 		return nil
 	end
@@ -977,23 +1141,6 @@ local function url_encode_path(path)
 end
 
 
--- Platform constants for the atomic-placement syscalls below.
-local IS_OSX = ffi.os == "OSX"
-local O_WRONLY = 1
-local O_CREAT = IS_OSX and 0x200 or 0x40
-local O_EXCL = IS_OSX and 0x800 or 0x80
-local AT_FDCWD = IS_OSX and -2 or -100
-local EEXIST, EXDEV, EINVAL = 17, 18, 22
-local ENOSYS = IS_OSX and 78 or 38
-local ENOTEMPTY = IS_OSX and 66 or 39
-local ENOTSUP = IS_OSX and 45 or 95
-local TRASHINFO_MODE = 384 -- 0600
-local MAX_NAME_ATTEMPTS = 1000
-
-local HAVE_NATIVE_NOREPLACE = pcall(function()
-	return IS_OSX and ffi.C.renamex_np or ffi.C.renameat2
-end)
-
 -- Trash entry name for the Nth reservation attempt. Attempt 0 keeps the plain
 -- basename (what users expect to see); later ones add timestamp, PID and the
 -- attempt number so racing processes diverge immediately instead of retrying
@@ -1006,65 +1153,12 @@ local function trash_candidate_name(base_name, attempt)
 		tonumber(ffi.C.getpid()), attempt)
 end
 
--- Reserve a Trash name by creating its .trashinfo with O_CREAT|O_EXCL, the
--- XDG Trash spec's own concurrency protocol (gio and trash-cli do the same).
--- The kernel arbitrates: exactly one process can create a given info file,
--- so there is no check-then-act window. Returns true, or false plus errno.
+-- Reserve a Trash name by creating its .trashinfo exclusively, the XDG Trash
+-- spec's own concurrency protocol (gio and trash-cli do the same). The kernel
+-- arbitrates: exactly one process can create a given info file, so there is
+-- no check-then-act window. Returns true, or false plus errno.
 local function reserve_trashinfo(info_path, body)
-	local fd = ffi.C.open(info_path, bit.bor(O_WRONLY, O_CREAT, O_EXCL), ffi.new("int", TRASHINFO_MODE))
-	if fd < 0 then
-		return false, ffi.errno()
-	end
-	local written = ffi.C.write(fd, body, #body)
-	ffi.C.close(fd)
-	if written ~= #body then
-		ffi.C.unlink(info_path)
-		return false, 0
-	end
-	return true
-end
-
--- Move src to dst ONLY if dst does not exist, atomically. Returns "ok",
--- "exists" (dst is occupied; nothing was touched), "xdev" (different
--- filesystems; caller must stage), or "error". Never replaces anything:
--- native no-replace rename first; without it, linkat+unlink for non-
--- directories and mkdir+rename-onto-our-own-empty-dir for directories, both
--- of which also fail rather than overwrite.
-local function rename_noreplace(src, dst)
-	local rc, err
-	if HAVE_NATIVE_NOREPLACE then
-		if IS_OSX then
-			rc = ffi.C.renamex_np(src, dst, 4) -- RENAME_EXCL
-		else
-			rc = ffi.C.renameat2(AT_FDCWD, src, AT_FDCWD, dst, 1) -- RENAME_NOREPLACE
-		end
-		if rc == 0 then return "ok" end
-		err = ffi.errno()
-		if err == EEXIST or err == ENOTEMPTY then return "exists" end
-		if err == EXDEV then return "xdev" end
-		if err ~= EINVAL and err ~= ENOSYS and err ~= ENOTSUP then return "error" end
-	end
-	if is_directory_nonlink(src) then
-		if fs.mkdir(dst) == nil then
-			return path_exists(dst) and "exists" or "error"
-		end
-		-- rename(2) may replace an EMPTY directory; this one is ours. If a
-		-- foreign writer filled it meanwhile, rename fails ENOTEMPTY instead.
-		if ffi.C.rename(src, dst) == 0 then return "ok" end
-		err = ffi.errno()
-		if err ~= ENOTEMPTY and err ~= EEXIST then ffi.C.rmdir(dst) end
-		if err == EXDEV then return "xdev" end
-		return "error"
-	end
-	-- flags=0: link the symlink itself, never its target (macOS link() follows).
-	if ffi.C.linkat(AT_FDCWD, src, AT_FDCWD, dst, 0) ~= 0 then
-		err = ffi.errno()
-		if err == EEXIST then return "exists" end
-		if err == EXDEV then return "xdev" end
-		return "error"
-	end
-	ffi.C.unlink(src)
-	return "ok"
+	return write_exclusive(info_path, body, TRASHINFO_MODE)
 end
 
 -- Copy an item across filesystems into a fresh mkdtemp directory inside the
@@ -1072,13 +1166,17 @@ end
 -- cannot collide with anyone; the final placement is then a same-filesystem
 -- atomic no-replace rename. Returns the staged path and its directory.
 local function stage_into_trash_fs(abs_path)
-	local template = ffi.new("char[?]", #TRASH_BASE_DIR + 32)
-	ffi.copy(template, path_join(TRASH_BASE_DIR, ".rm-safe-staging.XXXXXX"))
-	if ffi.C.mkdtemp(template) == nil then
+	local staging_dir = make_private_dir(TRASH_BASE_DIR, ".rm-safe-staging")
+	if not staging_dir then
 		return nil
 	end
-	local staging_dir = ffi.string(template)
-	local cmd = "mv -- " .. shell_quote(abs_path) .. " " .. shell_quote(staging_dir .. "/") .. " >/dev/null 2>&1"
+	-- Absolute path: a bare `mv` would obey exported shell functions.
+	local mv = resolve_real_tool("mv")
+	if not mv then
+		ffi.C.rmdir(staging_dir)
+		return nil
+	end
+	local cmd = shell_quote(mv) .. " -- " .. shell_quote(abs_path) .. " " .. shell_quote(staging_dir .. "/") .. " >/dev/null 2>&1"
 	if shell_status(cmd) ~= 0 then
 		-- A failed cross-device mv can leave a partial copy here; the
 		-- original is still intact (mv removes it only after a full copy).

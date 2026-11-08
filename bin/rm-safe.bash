@@ -324,9 +324,13 @@ log_action() {
 	timestamp_utc_into timestamp '%Y-%m-%dT%H:%M:%SZ'
 	frag_path=$(_fragment_path_for "$path") || return 0
 	# Write once, close. No append, no re-open — that's the whole point.
+	# noclobber makes the create exclusive (O_EXCL): a fragment is never
+	# replaced, even if a name ever repeated (names carry ns+counter+PID).
+	set -C
 	printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
 		"$timestamp" \
-		"$USER_NAME" "$action" "$path" "$trash_path" "$details" > "$frag_path"
+		"$USER_NAME" "$action" "$path" "$trash_path" "$details" 2>/dev/null > "$frag_path"
+	set +C
 }
 
 # Check if running in an interactive terminal
@@ -416,11 +420,9 @@ restore_trash_entry() {
 		return 1
 	fi
 
-	if [[ -e $original_path || -L $original_path ]]; then
-		echo "rm-safe: Error: Restore target already exists: $original_path" >&2
-		return 1
-	fi
-
+	# No "does the target exist?" pre-check: that would be check-then-act.
+	# The no-replace move IS the check, so a target that already exists and
+	# one created mid-restore are refused by the same atomic operation.
 	if [[ $original_path == */* ]]; then
 		original_dir=${original_path%/*}
 		[[ -z $original_dir ]] && original_dir="/"
@@ -434,7 +436,18 @@ restore_trash_entry() {
 		}
 	fi
 
-	if "$GMV" -- "$trash_path" "$original_path"; then
+	local move_rc
+	_mv_noreplace "$trash_path" "$original_path"
+	move_rc=$?
+	if [[ $move_rc -eq 4 ]]; then
+		_copy_restore_across_devices "$trash_path" "$original_path" "$original_dir"
+		move_rc=$?
+	fi
+	if [[ $move_rc -eq 3 ]]; then
+		echo "rm-safe: Error: Restore target already exists: $original_path" >&2
+		return 1
+	fi
+	if [[ $move_rc -eq 0 ]]; then
 		local info_file="$TRASH_INFO_DIR/${trash_path##*/}.trashinfo"
 		[[ -e $info_file ]] && _real_unlink "$info_file"
 		log_action "TRASH_RESTORE" "$trash_path" "$original_path"
@@ -718,16 +731,90 @@ _reserve_trashinfo() {
 	( set -C; printf '%s' "$2" >"$1" ) 2>/dev/null
 }
 
-# Detect once whether mv offers an atomic no-replace move. GNU mv -n issues
-# renameat2(RENAME_NOREPLACE); -T stops it descending into a directory that
-# occupies the destination. BSD mv -n is check-then-rename, so there the
-# .trashinfo reservation is the only arbiter (sufficient against every
-# spec-following trasher; Finder never writes into the Trash/files subdir).
+# No-replace move, mode chosen once. _mv_noreplace SRC DST exits: 0 moved,
+# 3 DST occupied (nothing touched), 4 cannot link across filesystems (caller
+# stages a copy on DST's filesystem), 1 other error.
+#  gnu:   GNU mv -n issues renameat2(RENAME_NOREPLACE): atomic for every file
+#         type; -T stops it descending into a directory occupying DST. GNU mv
+#         exits 0 even when it declines, so the outcome is read back from the
+#         filesystem. Across filesystems it creates the top-level DST with
+#         O_EXCL/mkdir, so it still cannot replace anything.
+#  posix: no BSD mv -n (it is check-then-rename). Instead, primitives that
+#         FAIL rather than replace: files via ln (link(2), EEXIST) + unlink;
+#         symlinks via ln -s of the same target (symlink(2), EEXIST) + unlink.
+#         Directories use plain mv, which cannot destroy data either: a
+#         directory cannot be renamed over a file or a non-empty directory.
+#         The residual: an EMPTY directory appearing at DST in the instant
+#         before the rename makes BSD mv move the item INTO it -- nested one
+#         level, never lost. On the Trash side DST's name is already reserved
+#         via its .trashinfo, so only a non-XDG writer could cause it. Only
+#         renameat2/renamex_np close that gap; the luajit impl uses them.
 if "$GMV" --version 2>/dev/null | grep -q GNU; then
-	_mv_noreplace() { "$GMV" -n -T -- "$1" "$2" 2>/dev/null; }
+	_NOREPLACE_MODE=gnu
 else
-	_mv_noreplace() { "$GMV" -n -- "$1" "$2" 2>/dev/null; }
+	_NOREPLACE_MODE=posix
 fi
+GCP=$(_resolve_tool gcp cp)
+GLN=$(_resolve_tool gln ln)
+GREADLINK=$(_resolve_tool greadlink readlink)
+
+_mv_noreplace() { # $1 = src, $2 = dst
+	local target
+	if [[ $_NOREPLACE_MODE == gnu ]]; then
+		"$GMV" -n -T -- "$1" "$2" 2>/dev/null
+		[[ ! -e $1 && ! -L $1 ]] && return 0
+		[[ -e $2 || -L $2 ]] && return 3
+		return 1
+	fi
+	if [[ -L $1 ]]; then
+		target=$("$GREADLINK" -- "$1") || return 1
+		if ! "$GLN" -s -- "$target" "$2" 2>/dev/null; then
+			[[ -e $2 || -L $2 ]] && return 3
+			return 1
+		fi
+		_real_unlink "$1"
+		return 0
+	fi
+	if [[ -d $1 ]]; then
+		# Early refusal only; the mv below cannot replace data (see above).
+		[[ -e $2 || -L $2 ]] && return 3
+		"$GMV" -- "$1" "$2" 2>/dev/null || return 1
+		return 0
+	fi
+	if "$GLN" -- "$1" "$2" 2>/dev/null; then
+		_real_unlink "$1"
+		return 0
+	fi
+	[[ -e $2 || -L $2 ]] && return 3
+	return 4
+}
+
+# Cross-device restore without a check-then-act window and without ever moving
+# data back: COPY the Trash entry into a private staging dir beside the target,
+# place the copy with an atomic no-replace move, and only then delete the Trash
+# original. Any failure deletes just the staging copy. Same exit codes as
+# _mv_noreplace. $1 = trash path, $2 = original path, $3 = original dir.
+_copy_restore_across_devices() {
+	local staging rc
+	# Fast refusal before a possibly large copy; the no-replace move below
+	# remains the authority if something appears in the meantime.
+	[[ -e $2 || -L $2 ]] && return 3
+	[[ -n $REAL_RM_TOOL ]] || return 1
+	staging=$("$GMKTEMP" -d "$3/.rm-safe-restore.XXXXXX" 2>/dev/null) || return 1
+	if ! "$GCP" -a -- "$1" "$staging/" 2>/dev/null; then
+		"$REAL_RM_TOOL" -rf -- "$staging"
+		return 1
+	fi
+	_mv_noreplace "$staging/${1##*/}" "$2"
+	rc=$?
+	if [[ $rc -ne 0 ]]; then
+		"$REAL_RM_TOOL" -rf -- "$staging"
+		return $rc
+	fi
+	_real_rmdir "$staging"
+	"$REAL_RM_TOOL" -rf -- "$1"
+	return 0
+}
 
 # Trash entry name for the Nth reservation attempt: the plain basename first,
 # then timestamp+PID+attempt so racing processes diverge immediately.
@@ -771,12 +858,20 @@ place_in_trash_into() { # $1 = out name var, $2 = out diagnostic var, $3 = abs p
 			break
 		fi
 		_mv_noreplace "$staged" "$TRASH_FILES_DIR/$name"
-		if [[ ! -e $staged && ! -L $staged ]]; then
-			_real_rmdir "$staging"
-			printf -v "$1" '%s' "$name"
-			return 0
-		fi
-		_real_unlink "$info_file" # release the reservation; name is occupied
+		case $? in
+			0)
+				_real_rmdir "$staging"
+				printf -v "$1" '%s' "$name"
+				return 0
+				;;
+			3)
+				_real_unlink "$info_file" # release the reservation; name is occupied
+				;;
+			*)
+				_real_unlink "$info_file"
+				break
+				;;
+		esac
 	done
 	printf -v "$2" '%s' "item is preserved in $staging"
 	return 1
